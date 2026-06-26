@@ -4,75 +4,269 @@ A production-minded feed handler that subscribes to all Binance USD-M perpetual 
 
 Implemented in both Python (prototype) and Rust (production target). The two implementations share identical state machine logic and pass the same test suite.
 
-## Repository Structure
+---
 
+## Getting Started
+
+### Prerequisites
+
+| Requirement | Version | Check |
+|---|---|---|
+| Python | 3.13+ | `python3 --version` |
+| pip | any | `pip --version` |
+| Rust | 1.75+ (2021 edition) | `rustc --version` |
+| cargo | (ships with Rust) | `cargo --version` |
+
+No API keys required -- Binance public WebSocket streams are unauthenticated.
+
+### Install Dependencies
+
+```bash
+# Python
+pip install -r python/requirements.txt
+
+# Rust (first build downloads and compiles dependencies, takes ~1-2 minutes)
+cd rust && cargo build --release && cd ..
 ```
-python/                  Python implementation (prototype)
-  book.py                  Per-symbol order book state machine (pure logic, no I/O)
-  feed_handler.py          WebSocket connections, REST snapshots, health server, monitoring
-  publisher.py             Pub/sub dispatcher + WebSocket server for consumers
-  requirements.txt         Python dependencies
 
-rust/                    Rust implementation (production target)
-  src/
-    main.rs                CLI entry point
-    book.rs                Order book state machine (port of book.py)
-    feed_handler.rs        Async runtime (port of feed_handler.py)
-    publisher.rs           Pub/sub + WebSocket server (port of publisher.py)
-  Cargo.toml               Rust dependencies
+---
 
-tests/
-  python/
-    test_book.py           23 tests for the Python book state machine
-    test_publisher.py      11 tests for pub/sub filtering and dispatch
-  rust/
-    test_book.rs           Standalone Rust test file (also embedded in book.rs)
-  cross_language_comparison.py   Generates deterministic scenarios, compares outputs
-```
-
-## Quick Start
+## Running the Feed Handler
 
 ### Python
 
 ```bash
-cd python
-pip install -r requirements.txt
+# All ~570 perpetual futures
+python python/feed_handler.py
 
-python feed_handler.py                    # all ~570 perps
-python feed_handler.py --max-symbols 10   # 10 symbols for testing
-python feed_handler.py --port 9090        # custom health server port
+# 10 symbols only (good for a quick test)
+python python/feed_handler.py --max-symbols 10
+
+# Custom ports
+python python/feed_handler.py --max-symbols 10 --port 9090 --ws-port 9091
 ```
 
 ### Rust
 
 ```bash
-cd rust
-cargo build --release
-./target/release/binance-feed-handler
-./target/release/binance-feed-handler --max-symbols 10
+# All ~570 perpetual futures
+./rust/target/release/binance-feed-handler
+
+# 10 symbols only
+./rust/target/release/binance-feed-handler --max-symbols 10
+
+# Custom ports
+./rust/target/release/binance-feed-handler --max-symbols 10 --port 9090 --ws-port 9091
 ```
 
-### Endpoints
+### CLI Options (identical for both)
 
-- Health: `curl http://localhost:8080/health`
-- Stats: `curl http://localhost:8080/stats`
-- WebSocket: `ws://localhost:8081/ws` (subscribe with JSON messages)
+| Flag | Default | Description |
+|---|---|---|
+| `--max-symbols N` | all (~570) | Cap the number of symbols to subscribe to |
+| `--port N` | 8080 | HTTP health/stats server port |
+| `--ws-port N` | 8081 | WebSocket consumer server port |
+
+### What You Should See
+
+On startup (with `--max-symbols 10`):
+
+```
+14:32:01.204 [INFO] Fetched 10 symbols, 1 shard(s)
+14:32:01.518 [INFO] [shard-0] connected, subscribing to 20 streams
+14:32:02.100 [INFO] [shard-0] subscribed to 20 streams
+14:32:02.300 [INFO] BTCUSDT: snapshot applied (lastUpdateId=...)
+...
+14:32:12.000 [INFO] shards=1/1 | books: 10 live | msgs=4830 | pub: 2100 bbo, 950 book | snaps=10 | latency=45ms | gaps=0 crossed=0
+```
+
+The periodic stats line (every 10s) shows live book counts, message throughput, snapshot counts, processing latency, and integrity counters.
+
+---
+
+## Subscribing to Data
+
+There are three ways to consume data from the feed handler.
+
+### Option 1: WebSocket Client (any language, recommended for reviewers)
+
+Connect to the WebSocket server and send a JSON subscribe message. Works with any WebSocket client -- `websocat`, `wscat`, Python, JavaScript, etc.
+
+**Using websocat (install: `brew install websocat` or `cargo install websocat`):**
+
+```bash
+# Start the feed handler in one terminal
+python python/feed_handler.py --max-symbols 10
+
+# In another terminal, subscribe to all BBO updates
+echo '{"action":"subscribe","stream":"bbo"}' | websocat ws://localhost:8081/ws
+
+# Subscribe to book updates for specific symbols only
+echo '{"action":"subscribe","stream":"book","symbols":["BTCUSDT","ETHUSDT"]}' | websocat ws://localhost:8081/ws
+
+# Subscribe to everything (BBO + book, all symbols)
+echo '{"action":"subscribe","stream":"all"}' | websocat ws://localhost:8081/ws
+```
+
+**Using Python (no extra deps beyond websockets, already in requirements.txt):**
+
+```python
+import asyncio
+import json
+import websockets
+
+async def main():
+    async with websockets.connect("ws://localhost:8081/ws") as ws:
+        # Subscribe to BBO for two symbols
+        await ws.send(json.dumps({
+            "action": "subscribe",
+            "stream": "bbo",
+            "symbols": ["BTCUSDT", "ETHUSDT"]
+        }))
+
+        # First message back is the subscription confirmation
+        print(await ws.recv())
+
+        # All subsequent messages are live market data
+        async for msg in ws:
+            data = json.loads(msg)
+            print(f"{data['symbol']}  bid={data['bid_price']}  ask={data['ask_price']}")
+
+asyncio.run(main())
+```
+
+**Using JavaScript / Node.js:**
+
+```javascript
+const ws = new WebSocket("ws://localhost:8081/ws");
+
+ws.onopen = () => {
+    ws.send(JSON.stringify({
+        action: "subscribe",
+        stream: "bbo",
+        symbols: ["BTCUSDT"]
+    }));
+};
+
+ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.log(`${data.symbol}  bid=${data.bid_price}  ask=${data.ask_price}`);
+};
+```
+
+### Option 2: HTTP Health & Stats Endpoints
+
+No subscription needed -- just curl while the feed handler is running.
+
+```bash
+# Health check (200 = healthy, 503 = degraded)
+curl http://localhost:8080/health
+
+# Full stats as JSON
+curl -s http://localhost:8080/stats | python3 -m json.tool
+```
+
+Stats response includes:
+- Per-symbol book states (live/buffering/uninitialized)
+- Per-shard connection status and message counts
+- Publish counters (BBO and book events)
+- Processing latency (ms)
+- Integrity counters (gaps, crossed books, BBO mismatches)
+
+### Option 3: In-Process Python Consumer
+
+For consumers in the same process, subscribe directly to the publisher module. This is what the built-in `demo_consumer` uses.
+
+```python
+import asyncio
+import publisher
+
+async def my_consumer():
+    # Get a filtered queue -- only BBO for BTCUSDT and ETHUSDT
+    q = publisher.subscribe(stream="bbo", symbols={"BTCUSDT", "ETHUSDT"})
+
+    while True:
+        event = await q.get()
+        spread = event["ask_price"] - event["bid_price"]
+        print(f"{event['symbol']}  bid={event['bid_price']}  ask={event['ask_price']}  spread={spread}")
+
+    # When done, clean up
+    publisher.unsubscribe(q)
+```
+
+### WebSocket Protocol Reference
+
+**Subscribe:**
+```json
+--> {"action": "subscribe", "stream": "bbo", "symbols": ["BTCUSDT", "ETHUSDT"]}
+<-- {"status": "subscribed", "stream": "bbo", "symbols": ["BTCUSDT", "ETHUSDT"]}
+<-- {"symbol": "BTCUSDT", "bid_price": "64000.50", "bid_qty": "1.234", "ask_price": "64001.00", "ask_qty": "0.567", "ts": 1719396000.123}
+<-- ...
+```
+
+**Unsubscribe:**
+```json
+--> {"action": "unsubscribe"}
+<-- {"status": "unsubscribed"}
+```
+
+**Stream options:**
+| Value | What you get |
+|---|---|
+| `"bbo"` | Best bid/ask updates (from bookTicker stream) |
+| `"book"` | L2 top-of-book snapshots (top 5 bids + asks after each depth diff) |
+| `"all"` | Both BBO and book updates |
+
+**Symbol filtering:**
+- Omit `"symbols"` to get all symbols.
+- Include `"symbols": ["BTCUSDT", "ETHUSDT"]` to filter to specific symbols only.
+
+**Message schemas:**
+
+BBO event:
+```json
+{"symbol": "BTCUSDT", "bid_price": "64000.50", "bid_qty": "1.234", "ask_price": "64001.00", "ask_qty": "0.567", "ts": 1719396000.123}
+```
+
+Book event:
+```json
+{"symbol": "BTCUSDT", "bids": [["64000.50", "1.234"], ["63999.00", "2.0"], ...], "asks": [["64001.00", "0.567"], ["64002.00", "3.0"], ...], "last_update_id": 12345678, "ts": 1719396000.123}
+```
+
+**Queue overflow:** If a consumer falls behind, oldest messages are dropped (not newest). Stale market data has negative value.
+
+---
 
 ## Running Tests
 
 ```bash
-# Python unit tests
+# Python unit tests (34 tests: 23 book + 11 publisher)
 python -m pytest tests/python/ -v
 
-# Rust unit tests
-cd rust && cargo test
+# Rust unit tests (13 tests)
+cd rust && cargo test && cd ..
 
-# Cross-language comparison (generates expected_outputs.json)
+# Cross-language comparison -- verifies Python and Rust produce identical results
+# Python-only (prints expected outputs):
 python tests/cross_language_comparison.py
 
-# With Rust binary for automated comparison
+# Automated comparison against Rust binary:
 python tests/cross_language_comparison.py --rust-binary rust/target/debug/binance-feed-handler
 ```
+
+For the cross-language comparison, build the debug binary first: `cd rust && cargo build && cd ..`
+
+The comparison runs 5 deterministic scenarios through both implementations and diffs every field:
+
+| Scenario | What it tests |
+|---|---|
+| `basic_lifecycle` | Full state machine: uninitialized -> buffering -> snapshot sync -> live -> diff application -> sequence gap |
+| `crossed_book` | Integrity check fires when best bid >= best ask, triggers re-snapshot |
+| `bbo_divergence` | Mismatch counter increments on divergence, resets on match, triggers re-snapshot at threshold |
+| `reset_and_resync` | Reset clears all state, allows fresh sync cycle |
+| `top_levels_ordering` | BTreeMap (Rust) vs sorted dict (Python) produce identical bid/ask ordering |
+
+---
 
 ## Architecture
 
@@ -81,8 +275,8 @@ python tests/cross_language_comparison.py --rust-binary rust/target/debug/binanc
 ```
 Binance WS --> run_shard() --> Book.on_depth()        --> book_q (L2 top-of-book)
                            --> Book.set_ticker_bbo()   |
-                           --> bbo_q (best bid/ask)    |
-                                                       v
+                           --> bbo_q (best bid/ask)     |
+                                                        v
 book_q / bbo_q --> publisher.run_dispatcher() --> subscriber queues (filtered)
                                               --> WebSocket server (:8081/ws)
 
@@ -110,21 +304,7 @@ The state machine is pure logic with no I/O. `on_depth()` returns an action (`"p
 
 Binance limits ~200 streams per WebSocket. With two streams per symbol, we shard at 100 symbols per connection (~6 shards for ~570 perps).
 
-### Consumer API
-
-**Internal** (same process):
-```python
-q = publisher.subscribe(stream="bbo", symbols={"BTCUSDT", "ETHUSDT"})
-while True:
-    msg = await q.get()
-```
-
-**External** (WebSocket):
-```json
---> {"action": "subscribe", "stream": "bbo", "symbols": ["BTCUSDT"]}
-<-- {"status": "subscribed", "stream": "bbo", "symbols": ["BTCUSDT"]}
-<-- {"symbol": "BTCUSDT", "bid_price": "64000.50", ...}
-```
+---
 
 ## Design Decisions
 
@@ -150,6 +330,8 @@ Drop-oldest policy on overflow. For market data, the latest state is always more
 
 Python uses `Decimal`; Rust uses `rust_decimal`. No floating-point representation errors.
 
+---
+
 ## Observability
 
 **Periodic log line** (every 10s):
@@ -173,25 +355,11 @@ shards=6/6 | books: 568 live, 2 buffering | msgs=184920 | pub: 92100 bbo, 45300 
 | BBO divergence | 10 consecutive mismatches vs bookTicker | Fall back to buffering, re-snapshot |
 | Sequence gap | `pu != last_update_id` | Fall back to buffering, re-snapshot |
 
-## Known Limitations
-
-### Not Implemented (Would Do With More Time)
-
-- **Warm standby connections**: shadow WS connections pre-subscribed and buffering, instant failover on primary drop.
-- **Prometheus / OTLP metrics**: current stats endpoint is JSON-over-HTTP. Production would use histogram latencies and alert-ready counters.
-- **Snapshot priority**: high-volume symbols could be prioritized in the snapshot queue.
-- **Message compression**: `permessage-deflate` would reduce bandwidth at CPU cost.
-- **Persistent state**: warm restarts via serialized book state (snapshot re-sync is ~3 minutes for 570 symbols, so marginal benefit).
-- **Multi-process**: horizontal scaling would shard symbols across processes/hosts.
-
-### Intentional Tradeoffs
-
-- **100 symbols per shard** vs 200 limit: headroom for subscribe/unsubscribe churn.
-- **500-level snapshots** (10 weight) vs 1000-level (50 weight): covers the actionable range.
-- **Drop-oldest queues**: stale market data has negative value.
-- **No authentication**: public data streams only.
+---
 
 ## Configuration
+
+All constants are defined at the top of each source file.
 
 | Constant | Default | Purpose |
 |---|---|---|
@@ -204,6 +372,8 @@ shards=6/6 | books: 568 live, 2 buffering | msgs=184920 | pub: 92100 bbo, 45300 
 | `QUEUE_MAX` | 100,000 | Output queue/channel capacity |
 | `BUFFER_MAX` | 5,000 | Per-book event buffer during sync |
 | `BBO_MISMATCH_THRESHOLD` | 10 | Consecutive mismatches before re-snapshot |
+
+---
 
 ## Python vs Rust
 
@@ -222,6 +392,54 @@ shards=6/6 | books: 568 live, 2 buffering | msgs=184920 | pub: 92100 bbo, 45300 
 | Counters | `int` (GIL-safe) | `AtomicU64` |
 
 The Rust version gains: zero-cost abstractions on the hot path, no GC pauses, true concurrent async (no GIL), and compile-time safety for shared state.
+
+---
+
+## Known Limitations
+
+### Not Implemented (Would Do With More Time)
+
+- **Warm standby connections**: shadow WS connections pre-subscribed and buffering, instant failover on primary drop.
+- **Prometheus / OTLP metrics**: current stats endpoint is JSON-over-HTTP. Production would use histogram latencies and alert-ready counters.
+- **Snapshot priority**: high-volume symbols could be prioritized in the snapshot queue.
+- **Message compression**: `permessage-deflate` would reduce bandwidth at CPU cost.
+- **Persistent state**: warm restarts via serialized book state (snapshot re-sync is ~3 minutes for 570 symbols, so marginal benefit).
+- **Multi-process**: horizontal scaling would shard symbols across processes/hosts.
+
+### Intentional Tradeoffs
+
+- **100 symbols per shard** vs 200 limit: headroom for subscribe/unsubscribe churn.
+- **500-level snapshots** (10 weight) vs 1000-level (50 weight): covers the actionable range.
+- **Drop-oldest queues**: stale market data has negative value.
+- **No authentication**: public data streams only.
+
+---
+
+## Repository Structure
+
+```
+python/                  Python implementation (prototype)
+  book.py                  Per-symbol order book state machine (pure logic, no I/O)
+  feed_handler.py          WebSocket connections, REST snapshots, health server, monitoring
+  publisher.py             Pub/sub dispatcher + WebSocket server for consumers
+  requirements.txt         Python dependencies
+
+rust/                    Rust implementation (production target)
+  src/
+    main.rs                CLI entry point + cross-language test scenarios
+    book.rs                Order book state machine (port of book.py)
+    feed_handler.rs        Async runtime (port of feed_handler.py)
+    publisher.rs           Pub/sub + WebSocket server (port of publisher.py)
+  Cargo.toml               Rust dependencies
+
+tests/
+  python/
+    test_book.py           23 tests for the Python book state machine
+    test_publisher.py      11 tests for pub/sub filtering and dispatch
+  rust/
+    test_book.rs           Standalone Rust test file (also embedded in book.rs)
+  cross_language_comparison.py   5 deterministic scenarios, compares Python vs Rust output
+```
 
 ## AI Disclosure
 
