@@ -1,0 +1,20 @@
+[package]
+name = "binance-feed-handler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+futures-util = "0.3"
+log = "0.4"
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json"] }
+rust_decimal = { version = "1", features = ["serde-str"] }
+rust_decimal_macros = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }

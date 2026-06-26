@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+tests/expected_outputs.json
+
+# Rust
+rust/target/
+rust/Cargo.lock
