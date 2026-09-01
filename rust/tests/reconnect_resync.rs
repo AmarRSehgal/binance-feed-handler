@@ -76,6 +76,10 @@ fn now_ms() -> u64 {
 
 // === MOCK VENUE HTTP + WS ===
 
+async fn ticker_24hr() -> Json<Value> {
+    Json(json!([{"symbol": SYMBOL, "quoteVolume": "1000000"}]))
+}
+
 async fn exchange_info() -> Json<Value> {
     Json(json!({"symbols": [
         {"symbol": SYMBOL, "contractType": "PERPETUAL", "status": "TRADING"},
@@ -141,6 +145,7 @@ async fn serve_stream(mut socket: WebSocket, venue: Arc<Venue>) {
 async fn start_venue(venue: Arc<Venue>) -> SocketAddr {
     let app = axum::Router::new()
         .route("/fapi/v1/exchangeInfo", get(exchange_info))
+        .route("/fapi/v1/ticker/24hr", get(ticker_24hr))
         .route("/fapi/v1/depth", get(depth))
         .route("/ws", get(ws_upgrade))
         .with_state(venue);
@@ -232,6 +237,7 @@ async fn reconnect_and_gap_recovery_resync_the_book() {
             ws_port: pub_port,
             ws_base: format!("ws://{}/ws", venue_addr),
             fapi_base: format!("http://{}", venue_addr),
+            snapshot_rate: binance_feed_handler::feed_handler::SNAPSHOT_RATE_DEFAULT,
         },
     ));
 

@@ -21,7 +21,7 @@ curl http://localhost:8080/health
 curl -s http://localhost:8080/stats | python3 -m json.tool
 ```
 
-Flags: `--max-symbols N` (takes the N most liquid by 24h quote volume, so a capped run includes BTCUSDT), `--symbols BTCUSDT,ETHUSDT` (explicit universe; unknown symbols are fatal at startup), `--port N` (default 8080), `--ws-port N` (default 8081), `--ws-base URL` (default `wss://fstream.binance.com/ws`).
+Flags: `--max-symbols N` (takes the N most liquid by 24h quote volume, so a capped run includes BTCUSDT), `--symbols BTCUSDT,ETHUSDT` (explicit universe; unknown symbols are fatal at startup), `--snapshot-rate` (REST snapshots/sec, default 3.0), `--port N` (default 8080), `--ws-port N` (default 8081), `--ws-base URL` (default `wss://fstream.binance.com/ws`), `--fapi-base URL` (default `https://fapi.binance.com`).
 
 ### Subscribing to data
 
@@ -79,9 +79,13 @@ python tests/cross_language_comparison.py --rust-binary rust/target/debug/binanc
 
 **Global update IDs.** Binance Futures draws `U`/`u`/`pu` from a single venue-wide counter rather than a per-symbol one (unlike Spot). Measured against the live feed: three symbols sampled concurrently occupy the *same* numeric ID range and their `[U, u]` intervals interleave, so the merged stream is not monotonic.
 
-That does **not** break the documented bridge check, though. Each symbol's `[U, u]` interval covers the whole global range since that symbol's own previous event, so per symbol the intervals tile contiguously and a REST `lastUpdateId` lands inside exactly one buffered event. Measured across BTC/ETH/SOL/DOGE/XRP: `U <= lastUpdateId <= u` held on 5/5 syncs, and `pu[i] == u[i-1]` held on 688/688 consecutive events. So the bridge check is enforced -- a snapshot whose first replayable diff starts after `lastUpdateId` is rejected and re-fetched rather than applied over a hole.
+Each symbol's `[U, u]` interval covers the whole global range since that symbol's own previous event, so per symbol the intervals tile contiguously (`pu[i] == u[i-1]`: 688/688 consecutive events) and a REST `lastUpdateId` lands inside exactly one of them. The bridge check is enforced: a snapshot whose first replayable diff starts after `lastUpdateId` is rejected and re-fetched rather than applied over a hole.
 
-The `need_first_event` escape hatch survives only for the case where the bridge genuinely cannot be proven: the snapshot is newer than everything buffered, nothing straddles it, and `last_update_id` is a REST id with no stream `u` to chain `pu` against. That path is counted (`unverified_bridge_count`) rather than silently trusted.
+The catch, measured on 2026-09-01: **the straddling event usually has not arrived yet when the snapshot does.** The REST snapshot reflects exchange state ahead of where the `@depth@100ms` stream has delivered, so `lastUpdateId` runs ahead of the symbol's last received `u` -- 36,769 global ids on BTCUSDT, 16,296 on ETHUSDT, 12,472 on SOLUSDT, 0 on the illiquid `1000BONKUSDC`. Every buffered diff is therefore older than the snapshot, nothing straddles it, and the sync takes the unproven path. In a live 15-symbol run 13 of 15 books went live that way, so `total_unverified_bridges` is the **normal** state on this venue, not an anomaly -- do not alert on it.
+
+Waiting instead of going live immediately would fix that: the straddling event does arrive, 26-70ms and 2-7 events later (BTCUSDT 26ms/7 events, ETHUSDT 69ms/3, SOLUSDT 27ms/2). See "what I'd do with more time".
+
+The `need_first_event` escape hatch covers that unproven path: nothing straddles the snapshot, so `last_update_id` is a `lastUpdateId` with no stream `u` to chain `pu` against, and the first live event is accepted without a sequence check. It is not a hole -- every diff with `u <= lastUpdateId` is already contained in the snapshot and is discarded, and the first accepted diff starts at or before `lastUpdateId + 1`, so the chain is contiguous. But it *is* one unverified event per sync, and it is counted (`unverified_bridge_count`) rather than silently trusted.
 
 **Dual-stream cross-validation.** Each symbol subscribes to `@depth@100ms` (sequenced diffs for the full book) and `@bookTicker` (independent BBO snapshots). The bookTicker feed cross-validates the book's best levels -- 10 consecutive mismatches trigger a re-snapshot. Catches drift that sequence checks alone would miss.
 
@@ -107,6 +111,7 @@ The `need_first_event` escape hatch survives only for the case where the bridge 
 | Crossed book | `best_bid >= best_ask` | Fall back to buffering, re-snapshot |
 | BBO divergence | 10 consecutive mismatches vs bookTicker | Fall back to buffering, re-snapshot |
 | Stale book | No update in 30s | Re-enter buffering and request a snapshot immediately |
+| Disconnect | Socket closed or errored | Un-sync every book on that shard at once, then reconnect and re-snapshot |
 
 ## Observability
 
@@ -123,18 +128,24 @@ All four surfaces (`/health`, `/stats`, `/metrics`, the stats line) derive from 
 
 - **Latency is a last-value gauge, not a histogram.** `/metrics` exposes alertable counters, but per-shard latency is the most recent sample rather than a percentile distribution. Production wants a histogram.
 - **No warm standby connections.** On disconnect, there's a cold reconnect + re-subscribe + re-snapshot cycle. Shadow connections pre-buffering would give instant failover.
-- **No snapshot prioritization.** All symbols snapshot in arrival order. High-volume symbols (BTC, ETH) should go first.
+- **The snapshot bridge is provable but is not being proved.** On an unstraddled snapshot the book goes live immediately and accepts one unverified event. Measured, the straddling event arrives 26-70ms later, so staying in `buffering` until it does would prove `U <= lastUpdateId <= u` on every active symbol and let `need_first_event` be deleted. Needs a third `on_snapshot` outcome (hold, don't refetch) plus a bounded fallback -- a symbol with no flow at all (e.g. `ALPACAUSDT`, whose `lastUpdateId` is 71bn ids behind the counter) will never produce a straddling event and must still go live.
 - **No message compression.** `permessage-deflate` would cut bandwidth at the cost of CPU.
-- **No persistent state.** Warm restarts would need serialized book state. Re-sync takes ~3 minutes for 570 symbols so the benefit is marginal.
+- **Cold start is ~190s for 570 symbols, and that is the venue's floor, not ours.** `/fapi/v1/depth?limit=500` costs 10 request weight against a 2400/min IP budget, so 4 req/s is 100% of it. Snapshots are paced in liquidity order (`--snapshot-rate`, default 3/s), which is why BTCUSDT is live at ~0.7s rather than at minute two, but the tail still takes minutes. Going faster means `limit=100` (weight 5) at the cost of book depth.
+- **No persistent state.** Warm restarts would need serialized book state.
+- **Load shedding drops different ends in the two implementations.** Python sheds the oldest queued event, Rust the newest, because tokio's `mpsc` has no sender-side pop. Drop-oldest is the right behaviour for market data, so Rust is the side that is wrong; fixing it means `tokio::sync::broadcast`, whose `Lagged(n)` is exactly the drop-oldest-and-count semantics wanted.
 - **Single-process.** Horizontal scaling would shard symbols across processes or hosts.
 
 ## How I used AI
 
 Claude was used throughout -- architecture discussion, protocol research, code generation for both implementations, and this README.
 
-Where it helped most: working through the global update ID problem -- and, on a later audit pass, correcting it. The original conclusion here was that the documented bridge check (`U <= lastUpdateId <= u`) "fails silently on Futures because the docs describe the Spot behavior," and the `need_first_event` flag was written to skip the check entirely. Measuring against the live feed showed that was half right: the IDs really are drawn from one venue-wide counter, but the per-symbol `[U, u]` intervals still tile that counter contiguously, so the documented check holds (5/5 syncs, 688/688 `pu` links). Skipping it was disabling the one guard that catches a torn snapshot. The check is now enforced and the escape hatch is narrowed to the genuinely unprovable case, and counted.
+Where it helped most: the global update ID problem, which took three passes to get right and is a decent case study in how a plausible mechanism survives longer than it should.
 
-The lesson worth keeping: a plausible mechanism ("other symbols consume the IDs") was reasoned into a design change without ever being measured. The measurement took about a minute.
+Pass one concluded that the documented bridge check (`U <= lastUpdateId <= u`) "fails silently on Futures because the docs describe the Spot behavior," and wrote `need_first_event` to skip the check entirely. Pass two measured it: the ids really are drawn from one venue-wide counter, but per symbol the `[U, u]` intervals tile that counter contiguously, so the check is sound -- skipping it was disabling the one guard against a torn snapshot. The check went back in.
+
+Pass three measured the thing neither earlier pass had: *how often the check actually fires*. 13 of 15 books in a live run went live on the unproven path, because the REST snapshot is ahead of the stream by tens of thousands of global ids and the straddling diff simply has not arrived yet. Pass two's "5/5 syncs" had measured the `pu` chain, not the bridge, and read the result as confirming both.
+
+The lesson worth keeping is the same one twice: each pass reasoned from a mechanism instead of a measurement, and each measurement took about a minute. Pass three also produced the fix -- wait 26-70ms for the straddling event -- which neither reasoning pass had reached.
 
 Where I caught it: the Rust port initially compiled with `String` arguments where `tokio-tungstenite` and `axum` expect `Utf8Bytes` -- five type mismatches that required `.into()` conversions. The cross-language comparison also caught a subtle difference in how the Python and Rust versions handle the `_need_first_event` flag during test scenarios, which required aligning the test helpers.
 

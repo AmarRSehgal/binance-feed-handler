@@ -18,3 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+[dev-dependencies]
+# test-util gives paused-clock tests, so pacer timing is asserted deterministically
+# instead of by sleeping in real time.
+tokio = { version = "1", features = ["full", "test-util"] }

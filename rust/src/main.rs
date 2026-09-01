@@ -39,6 +39,13 @@ struct Args {
     )]
     fapi_base: String,
 
+    #[arg(
+        long,
+        default_value_t = feed_handler::SNAPSHOT_RATE_DEFAULT,
+        help = "REST depth snapshots per second (4.0 is 100% of the USD-M IP weight budget at limit=500)"
+    )]
+    snapshot_rate: f64,
+
     #[arg(long, help = "Run cross-language comparison scenarios and print JSON")]
     test_scenarios: bool,
 
@@ -79,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         ws_port: args.ws_port,
         ws_base: args.ws_base,
         fapi_base: args.fapi_base,
+        snapshot_rate: args.snapshot_rate,
     })
     .await
 }
