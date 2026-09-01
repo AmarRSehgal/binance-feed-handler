@@ -236,6 +236,15 @@ impl Book {
         self.ticker_ask = ask;
     }
 
+    /// Reset and re-enter `Buffering` so a snapshot can be requested without
+    /// waiting for the next depth event. Used by the staleness sweeper: a symbol
+    /// that stopped ticking is exactly the one whose next depth event may be
+    /// minutes away, so `reset()` alone leaves it dark until then.
+    pub fn mark_for_resync(&mut self) {
+        self.reset();
+        self.state = BookState::Buffering;
+    }
+
     pub fn reset(&mut self) {
         self.bids.clear();
         self.asks.clear();

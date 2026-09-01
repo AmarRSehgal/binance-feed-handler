@@ -612,20 +612,56 @@ async fn log_stats(
     }
 }
 
-async fn check_stale(books: Arc<Mutex<HashMap<String, Book>>>) {
+/// Mark every live-but-silent book for resync and return the symbols to
+/// re-snapshot. Pure over `books` so the sweep decision is unit-testable.
+///
+/// `last_update_time` is pushed forward to `now` on trigger: a symbol whose
+/// stream is genuinely dead would otherwise re-qualify on every tick and
+/// snapshot-storm the REST budget.
+fn take_stale_books(
+    books: &mut HashMap<String, Book>,
+    now: f64,
+    threshold: f64,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for book in books.values_mut() {
+        if book.state == BookState::Live && (now - book.last_update_time) > threshold {
+            warn!(
+                "{}: stale for {:.0}s, re-snapshotting",
+                book.symbol,
+                now - book.last_update_time
+            );
+            book.mark_for_resync();
+            book.last_update_time = now;
+            stale.push(book.symbol.clone());
+        }
+    }
+    stale
+}
+
+async fn check_stale(
+    books: Arc<Mutex<HashMap<String, Book>>>,
+    client: reqwest::Client,
+    snap_lock: Arc<Mutex<f64>>,
+    snap_count: Arc<AtomicU64>,
+) {
     loop {
         sleep(Duration::from_secs_f64(STALE_THRESHOLD / 2.0)).await;
-        let now = now_secs();
-        let mut books = books.lock().await;
-        for book in books.values_mut() {
-            if book.state == BookState::Live && (now - book.last_update_time) > STALE_THRESHOLD {
-                warn!(
-                    "{}: stale for {:.0}s, resetting",
-                    book.symbol,
-                    now - book.last_update_time
-                );
-                book.reset();
-            }
+        let stale = {
+            let mut books = books.lock().await;
+            take_stale_books(&mut books, now_secs(), STALE_THRESHOLD)
+        };
+        // Reset alone only re-arms the state machine; the snapshot still has to
+        // be asked for, or recovery waits on a depth event that may be minutes
+        // out on an illiquid symbol.
+        for symbol in stale {
+            tokio::spawn(sync_book(
+                client.clone(),
+                symbol,
+                books.clone(),
+                snap_lock.clone(),
+                snap_count.clone(),
+            ));
         }
     }
 }
@@ -677,7 +713,7 @@ pub async fn run(
         bbo_tx,
         book_tx,
         shard_infos: shard_infos.clone(),
-        snap_lock,
+        snap_lock: snap_lock.clone(),
         snap_count: snap_count.clone(),
         bbo_count: bbo_count.clone(),
         book_count: book_count.clone(),
@@ -718,10 +754,66 @@ pub async fn run(
         book_count.clone(),
         snap_count.clone(),
     ));
-    tokio::spawn(check_stale(books.clone()));
+    tokio::spawn(check_stale(
+        books.clone(),
+        client.clone(),
+        snap_lock.clone(),
+        snap_count.clone(),
+    ));
 
     // Start dispatcher
     publisher::run_dispatcher(bbo_rx, book_rx).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn live_book(symbol: &str, last_update_time: f64) -> Book {
+        let mut b = Book::new(symbol.to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        b.on_snapshot(100, &[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))]);
+        b.last_update_time = last_update_time;
+        b
+    }
+
+    fn books_of(entries: Vec<Book>) -> HashMap<String, Book> {
+        entries.into_iter().map(|b| (b.symbol.clone(), b)).collect()
+    }
+
+    #[test]
+    fn test_stale_book_is_marked_for_resync() {
+        let mut books = books_of(vec![live_book("STALE", 0.0)]);
+        let stale = take_stale_books(&mut books, 100.0, 30.0);
+        assert_eq!(stale, vec!["STALE".to_string()]);
+        // Buffering (not Uninitialized) is what makes sync_book actually fetch.
+        assert_eq!(books["STALE"].state, BookState::Buffering);
+    }
+
+    #[test]
+    fn test_fresh_book_is_left_alone() {
+        let mut books = books_of(vec![live_book("FRESH", 90.0)]);
+        assert!(take_stale_books(&mut books, 100.0, 30.0).is_empty());
+        assert_eq!(books["FRESH"].state, BookState::Live);
+    }
+
+    #[test]
+    fn test_non_live_book_is_not_swept() {
+        let mut b = Book::new("BUFFERING".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        let mut books = books_of(vec![b]);
+        assert!(take_stale_books(&mut books, 1e9, 30.0).is_empty());
+    }
+
+    #[test]
+    fn test_sweep_does_not_refire_on_the_next_tick() {
+        // A symbol whose stream is dead must not re-snapshot every sweep: the
+        // trigger pushes last_update_time forward, and the book is no longer Live.
+        let mut books = books_of(vec![live_book("DEAD", 0.0)]);
+        assert_eq!(take_stale_books(&mut books, 100.0, 30.0).len(), 1);
+        assert!(take_stale_books(&mut books, 115.0, 30.0).is_empty());
+    }
 }
