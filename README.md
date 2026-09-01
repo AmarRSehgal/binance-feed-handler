@@ -58,11 +58,11 @@ Same CLI flags, same WebSocket protocol, same ports.
 ### Tests
 
 ```bash
-# Python (52 tests)
+# Python (64 tests)
 pip install -r python/requirements-dev.txt
 python -m pytest tests/python/ -v
 
-# Rust (39 unit + 1 end-to-end reconnect/resync test against a mock venue)
+# Rust (44 unit + 1 end-to-end reconnect/resync test against a mock venue)
 cd rust && cargo test && cd ..
 
 # Cross-language: 5 deterministic scenarios + a differential fuzzer that drives
