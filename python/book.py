@@ -32,6 +32,12 @@ class Book:
         self.snapshot_count = 0
         self.gap_count = 0
         self.crossed_count = 0
+        # Diffs shed because the resync buffer hit BUFFER_MAX. Non-zero means a
+        # snapshot took so long we lost events we might have needed to replay.
+        self.buffer_dropped = 0
+        # Snapshots where the documented bridge (U <= lastUpdateId <= u) could
+        # not be proven because no buffered event straddled the snapshot.
+        self.unverified_bridge_count = 0
         self._need_first_event = False
         self._ticker_bid = Decimal(0)
         self._ticker_ask = Decimal(0)
@@ -47,11 +53,11 @@ class Book:
         """
         if self.state == "uninitialized":
             self.state = "buffering"
-            self.buffer.append((U, u, pu, bids, asks))
+            self._buffer_push((U, u, pu, bids, asks))
             return "need_snapshot"
 
         if self.state == "buffering":
-            self.buffer.append((U, u, pu, bids, asks))
+            self._buffer_push((U, u, pu, bids, asks))
             return None
 
         # --- live ---
@@ -60,10 +66,12 @@ class Book:
             return None
 
         if self._need_first_event:
-            # Binance Futures uses global update IDs shared across all symbols.
-            # After a snapshot, the first depth event for THIS symbol often has
-            # U > snapshot.lastUpdateId because other symbols' events filled the
-            # gap. Safe to apply — no depth changes for this symbol were missed.
+            # Only set when NO buffered event straddled the snapshot, so there is
+            # nothing to chain pu against: last_update_id is a REST lastUpdateId,
+            # not a stream 'u'. Binance Futures draws U/u/pu from a venue-wide
+            # counter, so pu here belongs to a different point in the global
+            # sequence and comparing it would false-positive. Accept once, then
+            # the normal pu chain takes over. Counted as unverified_bridge_count.
             self._need_first_event = False
         elif pu != self.last_update_id:
             self.gap_count += 1
@@ -93,18 +101,35 @@ class Book:
         self.snapshot_count += 1
 
         applied_any = False
-        for buf_U, buf_u, buf_pu, buf_bids, buf_asks in self.buffer:
+        buffered = list(self.buffer)
+        self.buffer.clear()
+        for buf_U, buf_u, buf_pu, buf_bids, buf_asks in buffered:
             if buf_u < last_update_id:
                 continue
-            if applied_any and buf_pu != self.last_update_id:
+            if not applied_any:
+                # Binance's documented bridge: the first replayed event must
+                # straddle the snapshot (U <= lastUpdateId <= u). u >= lui is
+                # already true here, so only U needs checking. If U > lui the
+                # diffs covering (lui, U) are gone -- going live now would
+                # silently serve a book with a hole, so reject and re-snapshot.
+                if buf_U > last_update_id:
+                    logger.warning("%s: snapshot bridge broken (U=%d > lastUpdateId=%d), "
+                                   "re-snapshotting", self.symbol, buf_U, last_update_id)
+                    return False
+            elif buf_pu != self.last_update_id:
                 logger.debug("%s: pu gap in buffer during sync", self.symbol)
                 return False
             applied_any = True
             self._apply_diff(buf_bids, buf_asks, buf_u)
 
-        self.buffer.clear()
         self.state = "live"
+        # No buffered event straddled the snapshot, so the bridge is unproven.
+        # We accept the next live event without a pu check (Binance Futures
+        # draws U/u from a venue-wide counter, so pu will not line up with a
+        # REST lastUpdateId). Counted so this stays visible rather than silent.
         self._need_first_event = not applied_any
+        if not applied_any:
+            self.unverified_bridge_count += 1
         self._bbo_mismatch_count = 0
 
         if not self._check_integrity():
@@ -135,6 +160,14 @@ class Book:
         top_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:n]
         top_asks = sorted(self.asks.items(), key=lambda x: x[0])[:n]
         return top_bids, top_asks
+
+    def _buffer_push(self, event):
+        """Append to the resync buffer, counting drop-oldest evictions.
+        Losing the oldest buffered diff can break the snapshot bridge, so this
+        must never be silent."""
+        if len(self.buffer) >= BUFFER_MAX:
+            self.buffer_dropped += 1
+        self.buffer.append(event)
 
     def _apply_diff(self, bids, asks, u):
         for price, qty in bids:
@@ -180,5 +213,5 @@ class Book:
     def _to_buffering(self, U, u, pu, bids, asks):
         self.state = "buffering"
         self.buffer.clear()
-        self.buffer.append((U, u, pu, bids, asks))
+        self._buffer_push((U, u, pu, bids, asks))
         self._bbo_mismatch_count = 0
