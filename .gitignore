@@ -9,3 +9,6 @@ tests/expected_outputs.json
 # Rust
 rust/target/
 rust/Cargo.lock
+
+# macOS
+.DS_Store
