@@ -67,8 +67,30 @@ def _put(q: asyncio.Queue, item):
 
 # === REST ===
 
-async def fetch_symbols(session: aiohttp.ClientSession, max_symbols: int | None = None) -> list[str]:
-    """Get all trading USD-M perpetual futures symbols."""
+def pick_top_by_volume(symbols: list[str], volumes: dict[str, float], n: int) -> list[str]:
+    """Keep the `n` highest-24h-quote-volume symbols, returned alphabetically so
+    shard assignment stays deterministic across restarts.
+
+    A plain symbols[:n] after an alphabetical sort is what this replaces: it
+    selected 1000BONK/1000FLOKI/AAVE/ACE... and never once included BTCUSDT, so
+    every capped test run exercised the thinnest books on the venue.
+    Symbols missing from the ticker response rank last; ties break on name.
+    """
+    ranked = sorted(symbols, key=lambda s: (-volumes.get(s, 0.0), s))
+    return sorted(ranked[:n])
+
+
+async def fetch_quote_volumes(session: aiohttp.ClientSession) -> dict[str, float]:
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    return {t["symbol"]: float(t["quoteVolume"]) for t in data}
+
+
+async def fetch_symbols(session: aiohttp.ClientSession, max_symbols: int | None = None,
+                        explicit: list[str] | None = None) -> list[str]:
+    """Get the USD-M perpetual symbols to track."""
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
     async with session.get(url) as resp:
         resp.raise_for_status()
@@ -77,7 +99,18 @@ async def fetch_symbols(session: aiohttp.ClientSession, max_symbols: int | None 
         s["symbol"] for s in data["symbols"]
         if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING"
     )
-    return symbols[:max_symbols] if max_symbols else symbols
+
+    if explicit:
+        # A typo'd symbol would otherwise subscribe to a stream that never ticks
+        # and look like a dead feed, so reject it at startup.
+        unknown = [s for s in explicit if s not in set(symbols)]
+        if unknown:
+            raise SystemExit(f"--symbols: not a trading USD-M perpetual: {', '.join(unknown)}")
+        return sorted(set(explicit))
+
+    if max_symbols and max_symbols < len(symbols):
+        return pick_top_by_volume(symbols, await fetch_quote_volumes(session), max_symbols)
+    return symbols
 
 
 async def fetch_snapshot(session: aiohttp.ClientSession, symbol: str) -> dict:
@@ -344,7 +377,8 @@ async def demo_consumer():
 
 # === MAIN ===
 
-async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 8081):
+async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 8081,
+               symbols_arg: list[str] | None = None):
     global _snap_lock
     _snap_lock = asyncio.Lock()
 
@@ -357,8 +391,8 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
 
     async with aiohttp.ClientSession() as session:
         # Discover symbols
-        symbols = await fetch_symbols(session, max_symbols)
-        logger.info("Found %d perpetual symbols", len(symbols))
+        symbols = await fetch_symbols(session, max_symbols, symbols_arg)
+        logger.info("Tracking %d perpetual symbols", len(symbols))
 
         # Create per-symbol books
         books = {sym: Book(sym) for sym in symbols}
@@ -414,8 +448,12 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance USD-M Futures Feed Handler")
     parser.add_argument("--max-symbols", type=int, default=None,
-                        help="Cap symbol count (default: all perps)")
+                        help="Cap symbol count, taking the most liquid by 24h "
+                             "quote volume (default: all perps)")
+    parser.add_argument("--symbols", type=lambda v: v.split(","), default=None,
+                        help="Track exactly these symbols, e.g. BTCUSDT,ETHUSDT. "
+                             "Overrides --max-symbols")
     parser.add_argument("--port", type=int, default=8080, help="Health server port")
     parser.add_argument("--ws-port", type=int, default=8081, help="WebSocket server port")
     args = parser.parse_args()
-    asyncio.run(main(args.max_symbols, args.port, args.ws_port))
+    asyncio.run(main(args.max_symbols, args.port, args.ws_port, args.symbols))

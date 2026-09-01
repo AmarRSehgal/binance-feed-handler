@@ -140,18 +140,58 @@ struct SymbolInfo {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct Ticker24h {
+    symbol: String,
+    quote_volume: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DepthSnapshot {
     last_update_id: u64,
     bids: Vec<(String, String)>,
     asks: Vec<(String, String)>,
 }
 
+/// Keep the `n` highest-24h-quote-volume symbols, returned alphabetically so
+/// shard assignment stays deterministic across restarts.
+///
+/// A plain `truncate(n)` after an alphabetical sort is what this replaces: it
+/// selected 1000BONK/1000FLOKI/AAVE/ACE... and never once included BTCUSDT, so
+/// every capped test run exercised the thinnest books on the venue.
+/// Symbols missing from the ticker response rank last; ties break on name.
+fn pick_top_by_volume(
+    symbols: &[String],
+    volumes: &HashMap<String, f64>,
+    n: usize,
+) -> Vec<String> {
+    let mut ranked: Vec<&String> = symbols.iter().collect();
+    ranked.sort_by(|a, b| {
+        let va = volumes.get(*a).copied().unwrap_or(0.0);
+        let vb = volumes.get(*b).copied().unwrap_or(0.0);
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
+    });
+    let mut top: Vec<String> = ranked.into_iter().take(n).cloned().collect();
+    top.sort();
+    top
+}
+
+async fn fetch_quote_volumes(client: &reqwest::Client) -> anyhow::Result<HashMap<String, f64>> {
+    let url = format!("{}/fapi/v1/ticker/24hr", BINANCE_FAPI);
+    let tickers: Vec<Ticker24h> = client.get(&url).send().await?.error_for_status()?.json().await?;
+    Ok(tickers
+        .into_iter()
+        .map(|t| (t.symbol, t.quote_volume.parse::<f64>().unwrap_or(0.0)))
+        .collect())
+}
+
 async fn fetch_symbols(
     client: &reqwest::Client,
     max_symbols: Option<usize>,
+    explicit: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let url = format!("{}/fapi/v1/exchangeInfo", BINANCE_FAPI);
-    let info: ExchangeInfo = client.get(&url).send().await?.json().await?;
+    let info: ExchangeInfo = client.get(&url).send().await?.error_for_status()?.json().await?;
     let mut symbols: Vec<String> = info
         .symbols
         .into_iter()
@@ -159,8 +199,34 @@ async fn fetch_symbols(
         .map(|s| s.symbol)
         .collect();
     symbols.sort();
+
+    if !explicit.is_empty() {
+        // A typo'd symbol would otherwise subscribe to a stream that never ticks
+        // and look like a dead feed, so reject it at startup.
+        let known: std::collections::HashSet<&str> =
+            symbols.iter().map(String::as_str).collect();
+        let unknown: Vec<&str> = explicit
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !known.contains(s))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "--symbols: not a trading USD-M perpetual: {}",
+                unknown.join(", ")
+            );
+        }
+        let mut picked: Vec<String> = explicit.to_vec();
+        picked.sort();
+        picked.dedup();
+        return Ok(picked);
+    }
+
     if let Some(max) = max_symbols {
-        symbols.truncate(max);
+        if max < symbols.len() {
+            let volumes = fetch_quote_volumes(client).await?;
+            symbols = pick_top_by_volume(&symbols, &volumes, max);
+        }
     }
     Ok(symbols)
 }
@@ -670,6 +736,7 @@ async fn check_stale(
 
 pub async fn run(
     max_symbols: Option<usize>,
+    symbols_arg: Vec<String>,
     port: u16,
     ws_port: u16,
     ws_base: String,
@@ -677,8 +744,8 @@ pub async fn run(
     info!("Starting Binance USD-M Futures Feed Handler");
 
     let client = reqwest::Client::new();
-    let symbols = fetch_symbols(&client, max_symbols).await?;
-    info!("Found {} perpetual symbols", symbols.len());
+    let symbols = fetch_symbols(&client, max_symbols, &symbols_arg).await?;
+    info!("Tracking {} perpetual symbols", symbols.len());
 
     let books: HashMap<String, Book> = symbols
         .iter()
@@ -806,6 +873,50 @@ mod tests {
         b.on_depth(1, 10, 0, vec![], vec![]);
         let mut books = books_of(vec![b]);
         assert!(take_stale_books(&mut books, 1e9, 30.0).is_empty());
+    }
+
+    fn vols(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(s, v)| (s.to_string(), *v)).collect()
+    }
+
+    fn syms(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_cap_picks_the_most_liquid_not_the_alphabetically_first() {
+        // The regression: an alphabetical truncate(2) gives 1000BONK + AAVE and
+        // never BTCUSDT, so a capped run tests only the thinnest books.
+        let all = syms(&["1000BONKUSDT", "AAVEUSDT", "BTCUSDT", "ETHUSDT"]);
+        let v = vols(&[
+            ("1000BONKUSDT", 1.0e7),
+            ("AAVEUSDT", 5.0e7),
+            ("BTCUSDT", 9.0e9),
+            ("ETHUSDT", 4.0e9),
+        ]);
+        assert_eq!(pick_top_by_volume(&all, &v, 2), syms(&["BTCUSDT", "ETHUSDT"]));
+    }
+
+    #[test]
+    fn test_pick_returns_alphabetical_for_deterministic_sharding() {
+        let all = syms(&["AAA", "BBB", "CCC"]);
+        let v = vols(&[("AAA", 1.0), ("BBB", 3.0), ("CCC", 2.0)]);
+        assert_eq!(pick_top_by_volume(&all, &v, 3), syms(&["AAA", "BBB", "CCC"]));
+    }
+
+    #[test]
+    fn test_pick_ranks_missing_volume_last_and_breaks_ties_by_name() {
+        let all = syms(&["AAA", "BBB", "ZZZ"]);
+        // AAA and BBB tie; ZZZ has no ticker row at all.
+        let v = vols(&[("AAA", 5.0), ("BBB", 5.0)]);
+        assert_eq!(pick_top_by_volume(&all, &v, 2), syms(&["AAA", "BBB"]));
+        assert_eq!(pick_top_by_volume(&all, &v, 1), syms(&["AAA"]));
+    }
+
+    #[test]
+    fn test_pick_beyond_universe_size_returns_everything() {
+        let all = syms(&["AAA", "BBB"]);
+        assert_eq!(pick_top_by_volume(&all, &vols(&[("AAA", 1.0)]), 99), all);
     }
 
     #[test]
