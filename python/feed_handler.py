@@ -32,16 +32,19 @@ BINANCE_WS = "wss://fstream.binance.com/ws"
 
 MAX_SYMBOLS_PER_SHARD = 100
 SUBSCRIBE_BATCH_SIZE = 50
-SNAPSHOT_RATE = 3.0
+SNAPSHOT_RATE_DEFAULT = 3.0
 RECONNECT_BASE = 1.0
 RECONNECT_MAX = 30.0
 STATS_INTERVAL = 10
 STALE_THRESHOLD = 30.0
+# Negative event-time lag below this means the local clock disagrees with the
+# venue by enough that reported latencies are meaningless. Warned, not hidden.
+CLOCK_SKEW_WARN_MS = 50.0
 QUEUE_MAX = 100_000
 
-# Module-level snapshot rate limiter (initialized in main)
-_snap_lock: asyncio.Lock | None = None
-_snap_last_t = 0.0
+# Global snapshot pacer + liquidity ranks (initialized in main)
+_pacer: "SnapshotPacer | None" = None
+_snapshot_rank: dict[str, int] = {}
 _snap_count = 0
 
 # Publish counters
@@ -52,6 +55,63 @@ _book_count = 0
 # /stats, /metrics and the periodic stats line.
 _bbo_dropped = 0
 _book_dropped = 0
+
+
+# === SNAPSHOT PACING ===
+
+class SnapshotPacer:
+    """The only rate limit on /fapi/v1/depth, handing out slots in liquidity-rank
+    order.
+
+    Weight math: /fapi/v1/depth?limit=500 costs 10 request weight and the USD-M IP
+    budget is 2400 weight/minute, so 4.0 req/s is 100% of the budget. The 3.0
+    default leaves headroom for exchangeInfo/ticker and for the resnapshots that
+    gaps and staleness trigger during steady state. A ~570-symbol cold start is
+    therefore floor-bounded near 190s -- that is the venue's limit, not ours.
+
+    Which is why ORDER matters more than throughput. The previous pacer was a lock
+    plus a last-request timestamp, so slots went out in whatever order tasks
+    happened to contend, and BTCUSDT (rank 0 of 568) was as likely to be served at
+    second 180 as at second 1.
+    """
+
+    def __init__(self, rate: float):
+        if rate <= 0:
+            raise SystemExit(f"--snapshot-rate must be positive, got {rate}")
+        self._interval = 1.0 / rate
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._seq = 0
+        self._task = asyncio.create_task(self._pace())
+
+    async def acquire(self, rank: int):
+        """Wait for a slot. Lower `rank` is served first."""
+        fut = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        await self._queue.put((rank, self._seq, fut))
+        await fut
+
+    async def _pace(self):
+        loop = asyncio.get_running_loop()
+        # Start one interval out rather than at now(): the first slot is the most
+        # valuable one of a cold start, and granting it instantly would hand it to
+        # whichever of ~570 sync tasks happened to register first instead of to
+        # rank 0.
+        next_at = loop.time() + self._interval
+        while True:
+            wait = next_at - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            # get() after the sleep, so a rank-0 request that arrived during it
+            # does not queue behind the tail symbol that happened to ask first.
+            _rank, _seq, fut = await self._queue.get()
+            if fut.done():
+                # Requester was cancelled; do not burn a slot on it.
+                continue
+            fut.set_result(None)
+            next_at = loop.time() + self._interval
+
+    def stop(self):
+        self._task.cancel()
 
 
 # === HELPERS ===
@@ -82,6 +142,14 @@ def _put(q: asyncio.Queue, item) -> bool:
 
 # === REST ===
 
+def rank_by_volume(symbols: list[str], volumes: dict[str, float]) -> dict[str, int]:
+    """Rank symbols by 24h quote volume, 0 = most liquid. Drives both the
+    --max-symbols cap and snapshot ordering. Symbols missing from the ticker
+    response rank last; ties break on name, so the ordering is reproducible."""
+    ranked = sorted(symbols, key=lambda s: (-volumes.get(s, 0.0), s))
+    return {sym: i for i, sym in enumerate(ranked)}
+
+
 def pick_top_by_volume(symbols: list[str], volumes: dict[str, float], n: int) -> list[str]:
     """Keep the `n` highest-24h-quote-volume symbols, returned alphabetically so
     shard assignment stays deterministic across restarts.
@@ -91,8 +159,8 @@ def pick_top_by_volume(symbols: list[str], volumes: dict[str, float], n: int) ->
     every capped test run exercised the thinnest books on the venue.
     Symbols missing from the ticker response rank last; ties break on name.
     """
-    ranked = sorted(symbols, key=lambda s: (-volumes.get(s, 0.0), s))
-    return sorted(ranked[:n])
+    ranks = rank_by_volume(symbols, volumes)
+    return sorted(s for s in symbols if ranks[s] < n)
 
 
 async def fetch_quote_volumes(session: aiohttp.ClientSession) -> dict[str, float]:
@@ -103,9 +171,11 @@ async def fetch_quote_volumes(session: aiohttp.ClientSession) -> dict[str, float
     return {t["symbol"]: float(t["quoteVolume"]) for t in data}
 
 
-async def fetch_symbols(session: aiohttp.ClientSession, max_symbols: int | None = None,
-                        explicit: list[str] | None = None) -> list[str]:
-    """Get the USD-M perpetual symbols to track."""
+async def resolve_universe(session: aiohttp.ClientSession, max_symbols: int | None = None,
+                          explicit: list[str] | None = None
+                          ) -> tuple[list[str], dict[str, int]]:
+    """The symbol set to track (alphabetical, for deterministic sharding) plus the
+    order to snapshot it in (0 = snapshot first, ranked by 24h quote volume)."""
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
     async with session.get(url) as resp:
         resp.raise_for_status()
@@ -121,24 +191,22 @@ async def fetch_symbols(session: aiohttp.ClientSession, max_symbols: int | None 
         unknown = [s for s in explicit if s not in set(symbols)]
         if unknown:
             raise SystemExit(f"--symbols: not a trading USD-M perpetual: {', '.join(unknown)}")
-        return sorted(set(explicit))
+        symbols = sorted(set(explicit))
 
-    if max_symbols and max_symbols < len(symbols):
-        return pick_top_by_volume(symbols, await fetch_quote_volumes(session), max_symbols)
-    return symbols
+    # One ticker call serves both the cap and the snapshot ordering. Fatal on
+    # failure: this is startup, and a silent fall back to arrival order would
+    # reintroduce "BTCUSDT goes live at minute three" without saying so.
+    volumes = await fetch_quote_volumes(session)
+    if not explicit and max_symbols and max_symbols < len(symbols):
+        symbols = pick_top_by_volume(symbols, volumes, max_symbols)
+    return symbols, rank_by_volume(symbols, volumes)
 
 
 async def fetch_snapshot(session: aiohttp.ClientSession, symbol: str) -> dict:
-    """Fetch REST depth snapshot, rate-limited to SNAPSHOT_RATE req/sec."""
-    global _snap_last_t, _snap_count
+    """Fetch a REST depth snapshot, paced in liquidity-rank order."""
+    global _snap_count
 
-    # Pace requests to stay under Binance weight limits
-    async with _snap_lock:
-        now = asyncio.get_event_loop().time()
-        wait = _snap_last_t + (1.0 / SNAPSHOT_RATE) - now
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _snap_last_t = asyncio.get_event_loop().time()
+    await _pacer.acquire(_snapshot_rank.get(symbol, 1 << 30))
 
     url = f"{BINANCE_FAPI}/fapi/v1/depth"
     async with session.get(url, params={"symbol": symbol, "limit": 500}) as resp:
@@ -321,7 +389,7 @@ class Telemetry:
     snapshots_per_book: int
     unverified_bridges: int
     buffer_dropped: int
-    max_latency_ms: float
+    max_latency_ms: float | None
     bbo_published: int
     book_published: int
     snapshots: int
@@ -357,7 +425,7 @@ def gather_telemetry(books: dict[str, Book], shard_infos: list[dict],
         snaps_per_book += b.snapshot_count
         unverified += b.unverified_bridge_count
         buf_dropped += b.buffer_dropped
-    latencies = [s["latency_ms"] for s in shard_infos if s["latency_ms"] > 0]
+    latencies = [s["latency_ms"] for s in shard_infos if s["latency_ms"] is not None]
     return Telemetry(
         uptime_s=int(time.time() - start_time),
         shards=shard_infos,
@@ -370,7 +438,7 @@ def gather_telemetry(books: dict[str, Book], shard_infos: list[dict],
         snapshots_per_book=snaps_per_book,
         unverified_bridges=unverified,
         buffer_dropped=buf_dropped,
-        max_latency_ms=max(latencies) if latencies else 0.0,
+        max_latency_ms=max(latencies) if latencies else None,
         bbo_published=_bbo_count,
         book_published=_book_count,
         snapshots=_snap_count,
@@ -426,9 +494,11 @@ def render_prometheus(t: Telemetry) -> str:
            "counter",
            "".join(f'bfh_shard_messages_total{{shard="{s["id"]}"}} {s["msg_count"]}\n'
                    for s in t.shards))
+    # A shard with no sample yet emits no series: reporting 0 would be a lie a
+    # dashboard cannot distinguish from genuinely zero lag.
     family("bfh_shard_latency_ms", "Event-time to receive-time lag per shard", "gauge",
            "".join(f'bfh_shard_latency_ms{{shard="{s["id"]}"}} {s["latency_ms"]:.1f}\n'
-                   for s in t.shards))
+                   for s in t.shards if s["latency_ms"] is not None))
     return "".join(out)
 
 
@@ -494,13 +564,18 @@ async def log_stats(books: dict[str, Book], shard_infos: list[dict],
         t = gather_telemetry(books, shard_infos, start_time)
         logger.info(
             "shards=%d/%d | books: %d live, %d buffering | msgs=%d | "
-            "pub: %d bbo, %d book | snaps=%d | latency=%.0fms | "
+            "pub: %d bbo, %d book | snaps=%d | latency=%s | "
             "gaps=%d crossed=%d dropped=%d",
             t.connected, len(t.shards), t.book_state("live"), t.book_state("buffering"),
             sum(s["msg_count"] for s in t.shards),
-            t.bbo_published, t.book_published, t.snapshots, t.max_latency_ms,
+            t.bbo_published, t.book_published, t.snapshots,
+            "n/a" if t.max_latency_ms is None else f"{t.max_latency_ms:.0f}ms",
             t.gaps, t.crossed, t.total_dropped,
         )
+        if t.max_latency_ms is not None and t.max_latency_ms < -CLOCK_SKEW_WARN_MS:
+            logger.warning("event-time lag is %.0fms: the local clock is behind the "
+                           "venue, so every latency figure this process reports is "
+                           "offset by that much", t.max_latency_ms)
 
 
 def take_stale_books(books: dict[str, Book], now: float,
@@ -553,9 +628,10 @@ async def demo_consumer():
 # === MAIN ===
 
 async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 8081,
-               symbols_arg: list[str] | None = None):
-    global _snap_lock
-    _snap_lock = asyncio.Lock()
+               symbols_arg: list[str] | None = None,
+               snapshot_rate: float = SNAPSHOT_RATE_DEFAULT):
+    global _pacer, _snapshot_rank
+    _pacer = SnapshotPacer(snapshot_rate)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -566,8 +642,9 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
 
     async with aiohttp.ClientSession() as session:
         # Discover symbols
-        symbols = await fetch_symbols(session, max_symbols, symbols_arg)
-        logger.info("Tracking %d perpetual symbols", len(symbols))
+        symbols, _snapshot_rank = await resolve_universe(session, max_symbols, symbols_arg)
+        logger.info("Tracking %d perpetual symbols; snapshotting in liquidity "
+                    "order at %s/s", len(symbols), snapshot_rate)
 
         # Create per-symbol books
         books = {sym: Book(sym) for sym in symbols}
@@ -581,8 +658,11 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
         shard_tasks = []
         for i in range(0, len(symbols), MAX_SYMBOLS_PER_SHARD):
             chunk = symbols[i : i + MAX_SYMBOLS_PER_SHARD]
+            # latency_ms is None until the first sample, NOT 0.0: a real sample
+            # can legitimately be negative (clock skew against the venue) and a
+            # `> 0` filter would silently report that as zero lag.
             info = {"id": len(shard_infos), "connected": False, "msg_count": 0,
-                    "last_msg_time": 0.0, "latency_ms": 0.0}
+                    "last_msg_time": 0.0, "latency_ms": None}
             shard_infos.append(info)
             shard_tasks.append(asyncio.create_task(
                 run_shard(info["id"], chunk, books, session, bbo_q, book_q, info)
@@ -614,6 +694,7 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
 
         await stop.wait()
 
+        _pacer.stop()
         for t in shard_tasks + bg_tasks:
             t.cancel()
         await asyncio.gather(*shard_tasks, *bg_tasks, return_exceptions=True)
@@ -630,5 +711,9 @@ if __name__ == "__main__":
                              "Overrides --max-symbols")
     parser.add_argument("--port", type=int, default=8080, help="Health server port")
     parser.add_argument("--ws-port", type=int, default=8081, help="WebSocket server port")
+    parser.add_argument("--snapshot-rate", type=float, default=SNAPSHOT_RATE_DEFAULT,
+                        help="REST depth snapshots per second (4.0 is 100%% of the "
+                             "USD-M IP weight budget at limit=500)")
     args = parser.parse_args()
-    asyncio.run(main(args.max_symbols, args.port, args.ws_port, args.symbols))
+    asyncio.run(main(args.max_symbols, args.port, args.ws_port, args.symbols,
+                     args.snapshot_rate))

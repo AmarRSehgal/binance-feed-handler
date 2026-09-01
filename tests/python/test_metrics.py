@@ -64,6 +64,25 @@ def test_healthy_needs_all_shards_and_a_live_majority():
     assert not telemetry_fixture(connected=0).healthy, "a disconnected shard is never healthy"
 
 
+def test_unsampled_latency_emits_no_series():
+    # 0.0 would be indistinguishable from genuinely zero lag on a dashboard.
+    t = telemetry_fixture(shards=[{"id": 0, "connected": True, "msg_count": 1,
+                                   "last_msg_time": 1.0, "latency_ms": None}],
+                          max_latency_ms=None)
+    body = render_prometheus(t)
+    assert "# TYPE bfh_shard_latency_ms gauge" in body
+    assert "bfh_shard_latency_ms{shard=" not in body
+
+
+def test_negative_latency_is_reported_not_zeroed():
+    # Measured live: the local clock ran 86ms behind Binance's event time, and a
+    # `latency_ms > 0` filter reported that as 0ms.
+    t = telemetry_fixture(shards=[{"id": 0, "connected": True, "msg_count": 1,
+                                   "last_msg_time": 1.0, "latency_ms": -85.9}],
+                          max_latency_ms=-85.9)
+    assert 'bfh_shard_latency_ms{shard="0"} -85.9' in render_prometheus(t)
+
+
 def test_total_dropped_sums_every_shed_point():
     t = telemetry_fixture(bbo_dropped=1, book_dropped=2,
                           subscriber_dropped=4, buffer_dropped=8)

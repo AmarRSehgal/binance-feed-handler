@@ -42,11 +42,14 @@ pub const BINANCE_WS_DEFAULT: &str = "wss://fstream.binance.com/ws";
 
 const MAX_SYMBOLS_PER_SHARD: usize = 100;
 const SUBSCRIBE_BATCH_SIZE: usize = 50;
-const SNAPSHOT_RATE: f64 = 3.0;
+pub const SNAPSHOT_RATE_DEFAULT: f64 = 3.0;
 const RECONNECT_BASE: f64 = 1.0;
 const RECONNECT_MAX: f64 = 30.0;
 const STATS_INTERVAL: u64 = 10;
 const STALE_THRESHOLD: f64 = 30.0;
+/// Negative event-time lag below this means the local clock disagrees with the
+/// venue by enough that reported latencies are meaningless. Warned, not hidden.
+const CLOCK_SKEW_WARN_MS: f64 = 50.0;
 const QUEUE_MAX: usize = 100_000;
 
 // === TYPES ===
@@ -76,7 +79,10 @@ pub struct ShardInfo {
     pub connected: bool,
     pub msg_count: u64,
     pub last_msg_time: f64,
-    pub latency_ms: f64,
+    /// Event-time to receive-time lag. `None` until the first sample -- NOT 0.0,
+    /// because a real sample can legitimately be negative (clock skew against the
+    /// venue) and a `> 0.0` filter would silently report that as zero lag.
+    pub latency_ms: Option<f64>,
 }
 
 /// Shared handles every shard needs. Grouped into a struct so shards cannot be
@@ -88,7 +94,8 @@ struct ShardCtx {
     bbo_tx: mpsc::Sender<BboEvent>,
     book_tx: mpsc::Sender<BookEvent>,
     shard_infos: Arc<Mutex<Vec<ShardInfo>>>,
-    snap_lock: Arc<Mutex<f64>>,
+    pacer: Arc<SnapshotPacer>,
+    snapshot_rank: Arc<HashMap<String, u32>>,
     snap_count: Arc<AtomicU64>,
     bbo_count: Arc<AtomicU64>,
     book_count: Arc<AtomicU64>,
@@ -104,6 +111,115 @@ struct AppState {
     book_count: Arc<AtomicU64>,
     snap_count: Arc<AtomicU64>,
     start_time: Instant,
+}
+
+// === SNAPSHOT PACING ===
+
+/// The only rate limit on `/fapi/v1/depth`, handing out slots in liquidity-rank
+/// order.
+///
+/// Weight math: `/fapi/v1/depth?limit=500` costs 10 request weight and the USD-M
+/// IP budget is 2400 weight/minute, so 4.0 req/s is 100% of the budget. The 3.0
+/// default leaves headroom for exchangeInfo/ticker and for the resnapshots that
+/// gaps and staleness trigger during steady state. A ~570-symbol cold start is
+/// therefore floor-bounded near 190s -- that is the venue's limit, not ours.
+///
+/// Which is why ORDER matters more than throughput. The previous pacer was a
+/// mutex + last-request timestamp, so slots went out in whatever order tasks
+/// happened to contend, and BTCUSDT (rank 0 of 568) was as likely to be served
+/// at second 180 as at second 1. Ranked pacing puts the symbols anyone actually
+/// watches live within seconds and leaves the long tail to fill in behind them.
+pub struct SnapshotPacer {
+    tx: mpsc::UnboundedSender<Ticket>,
+    seq: AtomicU64,
+}
+
+/// A pending request for a rate-limit slot. Ordered by (rank, arrival) with the
+/// comparison inverted, so `BinaryHeap`'s max-pop yields the lowest rank first
+/// and FIFO within a rank.
+struct Ticket {
+    rank: u32,
+    seq: u64,
+    permit: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Ord for Ticket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.rank, other.seq).cmp(&(self.rank, self.seq))
+    }
+}
+impl PartialOrd for Ticket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Eq for Ticket {}
+impl PartialEq for Ticket {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rank, self.seq) == (other.rank, other.seq)
+    }
+}
+
+impl SnapshotPacer {
+    pub fn new(rate: f64) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(pace(rx, rate));
+        Self {
+            tx,
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Wait for a slot. Lower `rank` is served first.
+    pub async fn acquire(&self, rank: u32) {
+        let (permit, wait) = tokio::sync::oneshot::channel();
+        let ticket = Ticket {
+            rank,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            permit,
+        };
+        if self.tx.send(ticket).is_ok() {
+            let _ = wait.await;
+        }
+    }
+}
+
+async fn pace(mut rx: mpsc::UnboundedReceiver<Ticket>, rate: f64) {
+    // tokio's Instant, not std's: identical in production, but it respects the
+    // paused test clock so the pacing tests assert timing without sleeping.
+    use tokio::time::Instant;
+    let interval = Duration::from_secs_f64(1.0 / rate);
+    let mut heap: std::collections::BinaryHeap<Ticket> = std::collections::BinaryHeap::new();
+    // Start one interval out rather than at now(): the first slot is the most
+    // valuable one of a cold start, and granting it instantly would hand it to
+    // whichever of ~570 sync tasks happened to register first instead of to
+    // rank 0. One 1/rate delay buys correctly ordered pacing from slot one.
+    let mut next_at = Instant::now() + interval;
+
+    loop {
+        while let Ok(t) = rx.try_recv() {
+            heap.push(t);
+        }
+        if heap.is_empty() {
+            match rx.recv().await {
+                Some(t) => heap.push(t),
+                None => return,
+            }
+            continue;
+        }
+        let now = Instant::now();
+        if next_at > now {
+            sleep(next_at - now).await;
+            // Re-drain: a rank-0 request that arrived during the sleep must not
+            // queue behind the tail symbol that happened to ask first.
+            continue;
+        }
+        let ticket = heap.pop().expect("non-empty");
+        // A dropped requester (aborted sync task) must not burn a slot.
+        if ticket.permit.send(()).is_ok() {
+            next_at = now + interval;
+        }
+    }
 }
 
 // === HELPERS ===
@@ -158,25 +274,42 @@ struct DepthSnapshot {
     asks: Vec<(String, String)>,
 }
 
+/// Rank symbols by 24h quote volume, 0 = most liquid. Drives both the
+/// `--max-symbols` cap and snapshot ordering. Symbols missing from the ticker
+/// response rank last; ties break on name, so the ordering is reproducible.
+fn rank_by_volume(symbols: &[String], volumes: &HashMap<String, f64>) -> HashMap<String, u32> {
+    let mut ranked: Vec<&String> = symbols.iter().collect();
+    ranked.sort_by(|a, b| {
+        let va = volumes.get(*a).copied().unwrap_or(0.0);
+        let vb = volumes.get(*b).copied().unwrap_or(0.0);
+        vb.partial_cmp(&va)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u32))
+        .collect()
+}
+
 /// Keep the `n` highest-24h-quote-volume symbols, returned alphabetically so
 /// shard assignment stays deterministic across restarts.
 ///
 /// A plain `truncate(n)` after an alphabetical sort is what this replaces: it
 /// selected 1000BONK/1000FLOKI/AAVE/ACE... and never once included BTCUSDT, so
 /// every capped test run exercised the thinnest books on the venue.
-/// Symbols missing from the ticker response rank last; ties break on name.
 fn pick_top_by_volume(
     symbols: &[String],
     volumes: &HashMap<String, f64>,
     n: usize,
 ) -> Vec<String> {
-    let mut ranked: Vec<&String> = symbols.iter().collect();
-    ranked.sort_by(|a, b| {
-        let va = volumes.get(*a).copied().unwrap_or(0.0);
-        let vb = volumes.get(*b).copied().unwrap_or(0.0);
-        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
-    });
-    let mut top: Vec<String> = ranked.into_iter().take(n).cloned().collect();
+    let ranks = rank_by_volume(symbols, volumes);
+    let mut top: Vec<String> = symbols
+        .iter()
+        .filter(|s| (ranks[*s] as usize) < n)
+        .cloned()
+        .collect();
     top.sort();
     top
 }
@@ -193,12 +326,20 @@ async fn fetch_quote_volumes(
         .collect())
 }
 
-async fn fetch_symbols(
+/// The symbol set to track, plus the order to snapshot it in.
+pub struct Universe {
+    /// Alphabetical, so shard assignment is deterministic across restarts.
+    pub symbols: Vec<String>,
+    /// 0 = snapshot first. Ranked by 24h quote volume.
+    pub snapshot_rank: HashMap<String, u32>,
+}
+
+async fn resolve_universe(
     client: &reqwest::Client,
     fapi_base: &str,
     max_symbols: Option<usize>,
     explicit: &[String],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Universe> {
     let url = format!("{}/fapi/v1/exchangeInfo", fapi_base);
     let info: ExchangeInfo = client.get(&url).send().await?.error_for_status()?.json().await?;
     let mut symbols: Vec<String> = info
@@ -228,34 +369,36 @@ async fn fetch_symbols(
         let mut picked: Vec<String> = explicit.to_vec();
         picked.sort();
         picked.dedup();
-        return Ok(picked);
+        symbols = picked;
     }
 
-    if let Some(max) = max_symbols {
-        if max < symbols.len() {
-            let volumes = fetch_quote_volumes(client, fapi_base).await?;
-            symbols = pick_top_by_volume(&symbols, &volumes, max);
+    // One ticker call serves both the cap and the snapshot ordering. Fatal on
+    // failure: this is startup, and a silent fall back to arrival order would
+    // reintroduce "BTCUSDT goes live at minute three" without saying so.
+    let volumes = fetch_quote_volumes(client, fapi_base).await?;
+    if explicit.is_empty() {
+        if let Some(max) = max_symbols {
+            if max < symbols.len() {
+                symbols = pick_top_by_volume(&symbols, &volumes, max);
+            }
         }
     }
-    Ok(symbols)
+    let snapshot_rank = rank_by_volume(&symbols, &volumes);
+    Ok(Universe {
+        symbols,
+        snapshot_rank,
+    })
 }
 
 async fn fetch_snapshot(
     client: &reqwest::Client,
     fapi_base: &str,
     symbol: &str,
-    snap_lock: &Mutex<f64>,
+    rank: u32,
+    pacer: &SnapshotPacer,
     snap_count: &AtomicU64,
 ) -> anyhow::Result<DepthSnapshot> {
-    {
-        let mut last_t = snap_lock.lock().await;
-        let now = now_secs();
-        let wait = *last_t + (1.0 / SNAPSHOT_RATE) - now;
-        if wait > 0.0 {
-            sleep(Duration::from_secs_f64(wait)).await;
-        }
-        *last_t = now_secs();
-    }
+    pacer.acquire(rank).await;
 
     let url = format!("{}/fapi/v1/depth", fapi_base);
     let resp = client
@@ -287,8 +430,9 @@ async fn sync_book(
     client: reqwest::Client,
     fapi_base: String,
     symbol: String,
+    rank: u32,
     books: Arc<Mutex<HashMap<String, Book>>>,
-    snap_lock: Arc<Mutex<f64>>,
+    pacer: Arc<SnapshotPacer>,
     snap_count: Arc<AtomicU64>,
 ) {
     let mut delay = 1.0;
@@ -300,7 +444,7 @@ async fn sync_book(
             }
         }
 
-        match fetch_snapshot(&client, &fapi_base, &symbol, &snap_lock, &snap_count).await {
+        match fetch_snapshot(&client, &fapi_base, &symbol, rank, &pacer, &snap_count).await {
             Ok(data) => {
                 let bids = parse_levels(&data.bids);
                 let asks = parse_levels(&data.asks);
@@ -330,7 +474,8 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
         bbo_tx,
         book_tx,
         shard_infos,
-        snap_lock,
+        pacer,
+        snapshot_rank,
         snap_count,
         bbo_count,
         book_count,
@@ -349,8 +494,9 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
             client.clone(),
             fapi_base.clone(),
             sym.to_string(),
+            snapshot_rank.get(sym).copied().unwrap_or(u32::MAX),
             books.clone(),
-            snap_lock.clone(),
+            pacer.clone(),
             snap_count.clone(),
         ));
         sync_handles.insert(sym.to_string(), handle);
@@ -439,7 +585,7 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
                     if let Some(event_time) = msg.get("E").and_then(|v| v.as_f64()) {
                         let latency = now_secs() * 1000.0 - event_time;
                         let mut infos = shard_infos.lock().await;
-                        infos[shard_id].latency_ms = latency;
+                        infos[shard_id].latency_ms = Some(latency);
                     }
 
                     let evt = match msg.get("e").and_then(|v| v.as_str()) {
@@ -602,7 +748,8 @@ struct Telemetry {
     snapshots_per_book: u64,
     unverified_bridges: u64,
     buffer_dropped: u64,
-    max_latency_ms: f64,
+    /// Worst per-shard lag, or None if no shard has sampled one yet.
+    max_latency_ms: Option<f64>,
     bbo_published: u64,
     book_published: u64,
     snapshots: u64,
@@ -643,9 +790,8 @@ impl Telemetry {
             connected: shards.iter().filter(|s| s.connected).count(),
             max_latency_ms: shards
                 .iter()
-                .filter(|s| s.latency_ms > 0.0)
-                .map(|s| s.latency_ms)
-                .fold(0.0_f64, f64::max),
+                .filter_map(|s| s.latency_ms)
+                .reduce(f64::max),
             shards,
             book_states,
             live,
@@ -800,9 +946,12 @@ fn render_prometheus(t: &Telemetry) -> String {
           t.shards.iter()
               .map(|s| format!("bfh_shard_messages_total{{shard=\"{}\"}} {}\n", s.id, s.msg_count))
               .collect::<String>());
+    // A shard with no sample yet emits no series: reporting 0 would be a lie a
+    // dashboard cannot distinguish from genuinely zero lag.
     gauge("bfh_shard_latency_ms", "Event-time to receive-time lag per shard", "gauge",
           t.shards.iter()
-              .map(|s| format!("bfh_shard_latency_ms{{shard=\"{}\"}} {:.1}\n", s.id, s.latency_ms))
+              .filter_map(|s| s.latency_ms.map(|l| (s.id, l)))
+              .map(|(id, l)| format!("bfh_shard_latency_ms{{shard=\"{}\"}} {:.1}\n", id, l))
               .collect::<String>());
 
     out
@@ -816,7 +965,7 @@ async fn log_stats(state: AppState) {
         let t = Telemetry::gather(&state).await;
         info!(
             "shards={}/{} | books: {} live, {} buffering | msgs={} | \
-             pub: {} bbo, {} book | snaps={} | latency={:.0}ms | gaps={} crossed={} dropped={}",
+             pub: {} bbo, {} book | snaps={} | latency={} | gaps={} crossed={} dropped={}",
             t.connected,
             t.shards.len(),
             t.book_state("live"),
@@ -825,11 +974,19 @@ async fn log_stats(state: AppState) {
             t.bbo_published,
             t.book_published,
             t.snapshots,
-            t.max_latency_ms,
+            t.max_latency_ms
+                .map_or_else(|| "n/a".to_string(), |l| format!("{:.0}ms", l)),
             t.gaps,
             t.crossed,
             t.total_dropped(),
         );
+        if t.max_latency_ms.is_some_and(|l| l < -CLOCK_SKEW_WARN_MS) {
+            warn!(
+                "event-time lag is {:.0}ms: the local clock is behind the venue, so \
+                 every latency figure this process reports is offset by that much",
+                t.max_latency_ms.unwrap()
+            );
+        }
     }
 }
 
@@ -864,7 +1021,8 @@ async fn check_stale(
     books: Arc<Mutex<HashMap<String, Book>>>,
     client: reqwest::Client,
     fapi_base: String,
-    snap_lock: Arc<Mutex<f64>>,
+    pacer: Arc<SnapshotPacer>,
+    snapshot_rank: Arc<HashMap<String, u32>>,
     snap_count: Arc<AtomicU64>,
 ) {
     loop {
@@ -877,12 +1035,14 @@ async fn check_stale(
         // be asked for, or recovery waits on a depth event that may be minutes
         // out on an illiquid symbol.
         for symbol in stale {
+            let rank = snapshot_rank.get(&symbol).copied().unwrap_or(u32::MAX);
             tokio::spawn(sync_book(
                 client.clone(),
                 fapi_base.clone(),
                 symbol,
+                rank,
                 books.clone(),
-                snap_lock.clone(),
+                pacer.clone(),
                 snap_count.clone(),
             ));
         }
@@ -901,6 +1061,9 @@ pub struct Config {
     pub ws_port: u16,
     pub ws_base: String,
     pub fapi_base: String,
+    /// REST depth snapshots per second. See `SnapshotPacer` for the weight math;
+    /// 4.0 is 100% of the USD-M IP budget at limit=500.
+    pub snapshot_rate: f64,
 }
 
 impl Default for Config {
@@ -912,6 +1075,7 @@ impl Default for Config {
             ws_port: 8081,
             ws_base: BINANCE_WS_DEFAULT.to_string(),
             fapi_base: BINANCE_FAPI_DEFAULT.to_string(),
+            snapshot_rate: SNAPSHOT_RATE_DEFAULT,
         }
     }
 }
@@ -924,12 +1088,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         ws_port,
         ws_base,
         fapi_base,
+        snapshot_rate,
     } = cfg;
     info!("Starting Binance USD-M Futures Feed Handler");
 
+    if snapshot_rate.is_nan() || snapshot_rate <= 0.0 {
+        anyhow::bail!("--snapshot-rate must be positive, got {}", snapshot_rate);
+    }
+
     let client = reqwest::Client::new();
-    let symbols = fetch_symbols(&client, &fapi_base, max_symbols, &symbols_arg).await?;
-    info!("Tracking {} perpetual symbols", symbols.len());
+    let Universe {
+        symbols,
+        snapshot_rank,
+    } = resolve_universe(&client, &fapi_base, max_symbols, &symbols_arg).await?;
+    let snapshot_rank = Arc::new(snapshot_rank);
+    info!(
+        "Tracking {} perpetual symbols; snapshotting in liquidity order at {}/s",
+        symbols.len(),
+        snapshot_rate
+    );
 
     let books: HashMap<String, Book> = symbols
         .iter()
@@ -940,7 +1117,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let (bbo_tx, bbo_rx) = mpsc::channel::<BboEvent>(QUEUE_MAX);
     let (book_tx, book_rx) = mpsc::channel::<BookEvent>(QUEUE_MAX);
 
-    let snap_lock = Arc::new(Mutex::new(0.0_f64));
+    let pacer = Arc::new(SnapshotPacer::new(snapshot_rate));
     let snap_count = Arc::new(AtomicU64::new(0));
     let bbo_count = Arc::new(AtomicU64::new(0));
     let book_count = Arc::new(AtomicU64::new(0));
@@ -953,7 +1130,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             connected: false,
             msg_count: 0,
             last_msg_time: 0.0,
-            latency_ms: 0.0,
+            latency_ms: None,
         })
         .collect();
     let shard_infos = Arc::new(Mutex::new(shard_infos));
@@ -964,7 +1141,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         bbo_tx,
         book_tx,
         shard_infos: shard_infos.clone(),
-        snap_lock: snap_lock.clone(),
+        pacer: pacer.clone(),
+        snapshot_rank: snapshot_rank.clone(),
         snap_count: snap_count.clone(),
         bbo_count: bbo_count.clone(),
         book_count: book_count.clone(),
@@ -1005,7 +1183,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         books.clone(),
         client.clone(),
         fapi_base.clone(),
-        snap_lock.clone(),
+        pacer.clone(),
+        snapshot_rank.clone(),
         snap_count.clone(),
     ));
 
@@ -1064,7 +1243,7 @@ mod tests {
                 connected: true,
                 msg_count: 7,
                 last_msg_time: 1.0,
-                latency_ms: 12.5,
+                latency_ms: Some(12.5),
             }],
             connected: 1,
             book_states: [("live".to_string(), 2)].into_iter().collect(),
@@ -1075,7 +1254,7 @@ mod tests {
             snapshots_per_book: 3,
             unverified_bridges: 1,
             buffer_dropped: 0,
-            max_latency_ms: 12.5,
+            max_latency_ms: Some(12.5),
             bbo_published: 100,
             book_published: 50,
             snapshots: 3,
@@ -1127,6 +1306,27 @@ mod tests {
     }
 
     #[test]
+    fn test_unsampled_latency_emits_no_series() {
+        // 0.0 would be indistinguishable from genuinely zero lag on a dashboard.
+        let mut t = telemetry_fixture();
+        t.shards[0].latency_ms = None;
+        t.max_latency_ms = None;
+        let body = render_prometheus(&t);
+        assert!(body.contains("# TYPE bfh_shard_latency_ms gauge"));
+        assert!(!body.contains("bfh_shard_latency_ms{shard="));
+    }
+
+    #[test]
+    fn test_negative_latency_is_reported_not_zeroed() {
+        // Measured live: the local clock ran 86ms behind Binance's event time,
+        // and a `latency_ms > 0.0` filter reported that as 0ms.
+        let mut t = telemetry_fixture();
+        t.shards[0].latency_ms = Some(-85.9);
+        t.max_latency_ms = Some(-85.9);
+        assert!(render_prometheus(&t).contains("bfh_shard_latency_ms{shard=\"0\"} -85.9"));
+    }
+
+    #[test]
     fn test_total_dropped_sums_every_shed_point() {
         let mut t = telemetry_fixture();
         t.bbo_dropped = 1;
@@ -1142,6 +1342,54 @@ mod tests {
 
     fn syms(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pacer_serves_lowest_rank_first() {
+        // Every symbol asks at once, exactly as a cold start does. Ordering must
+        // follow rank, not arrival: the previous mutex-and-timestamp pacer served
+        // whoever contended first, so BTCUSDT (rank 0 of 568) could be last.
+        let pacer = Arc::new(SnapshotPacer::new(1.0));
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for rank in [7u32, 3, 0, 5, 1] {
+            let pacer = pacer.clone();
+            let served = served.clone();
+            handles.push(tokio::spawn(async move {
+                pacer.acquire(rank).await;
+                served.lock().await.push(rank);
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(*served.lock().await, vec![0, 1, 3, 5, 7]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pacer_enforces_the_rate() {
+        let pacer = SnapshotPacer::new(2.0);
+        let start = tokio::time::Instant::now();
+        for _ in 0..5 {
+            pacer.acquire(0).await;
+        }
+        // 5 slots at 2/s, the first one interval out: 5 x 500ms.
+        assert!(
+            start.elapsed() >= Duration::from_millis(2500),
+            "5 slots at 2/s took only {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_rank_is_zero_based_and_liquidity_ordered() {
+        let all = syms(&["AAAUSDT", "BTCUSDT", "ZZZUSDT"]);
+        let v = vols(&[("AAAUSDT", 1.0), ("BTCUSDT", 9.0e9), ("ZZZUSDT", 5.0)]);
+        let ranks = rank_by_volume(&all, &v);
+        assert_eq!(ranks["BTCUSDT"], 0);
+        assert_eq!(ranks["ZZZUSDT"], 1);
+        assert_eq!(ranks["AAAUSDT"], 2);
     }
 
     #[test]
