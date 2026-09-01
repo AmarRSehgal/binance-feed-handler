@@ -543,7 +543,9 @@ async def start_health_server(books: dict[str, Book], shard_infos: list[dict],
 
     async def metrics_handler(_req):
         body = render_prometheus(gather_telemetry(books, shard_infos, start_time))
-        return web.Response(text=body, content_type="text/plain",
+        # content_type= and an explicit content-type header are mutually
+        # exclusive in aiohttp; the version parameter has to ride the header.
+        return web.Response(text=body,
                             headers={"content-type": "text/plain; version=0.0.4"})
 
     app = web.Application()
