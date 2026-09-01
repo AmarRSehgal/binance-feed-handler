@@ -30,6 +30,18 @@ SUBSCRIBER_QUEUE_MAX = 10_000
 
 _subscribers: list[dict] = []
 
+# Messages shed because a subscriber's queue was full (slow consumer).
+# Never silent: surfaced in /stats and /metrics.
+_dropped = 0
+
+
+def dropped_count() -> int:
+    return _dropped
+
+
+def subscriber_count() -> int:
+    return len(_subscribers)
+
 
 # === SERIALIZATION ===
 
@@ -67,17 +79,27 @@ def unsubscribe(q: asyncio.Queue):
 # === DISPATCHER ===
 
 def _put(q: asyncio.Queue, msg: dict):
+    """Enqueue, shedding the OLDEST message on overflow. Counted, never silent.
+
+    Cross-language divergence, deliberate and documented: Rust's tokio mpsc has
+    no sender-side pop, so the Rust publisher sheds the NEWEST message instead.
+    Both count into the same metric name.
+    """
+    global _dropped
+    try:
+        q.put_nowait(msg)
+        return
+    except asyncio.QueueFull:
+        pass
+    _dropped += 1
+    try:
+        q.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
     try:
         q.put_nowait(msg)
     except asyncio.QueueFull:
-        try:
-            q.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-        try:
-            q.put_nowait(msg)
-        except asyncio.QueueFull:
-            pass
+        pass
 
 
 def _publish(msg: dict, stream: str):

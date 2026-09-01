@@ -14,6 +14,7 @@ import logging
 import random
 import signal
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 
 import aiohttp
@@ -47,22 +48,36 @@ _snap_count = 0
 _bbo_count = 0
 _book_count = 0
 
+# Events shed because a dispatcher queue was full. Never silent: surfaced in
+# /stats, /metrics and the periodic stats line.
+_bbo_dropped = 0
+_book_dropped = 0
+
 
 # === HELPERS ===
 
-def _put(q: asyncio.Queue, item):
-    """Put item on queue, dropping oldest on overflow."""
+def _put(q: asyncio.Queue, item) -> bool:
+    """Enqueue, shedding the OLDEST item on overflow. Returns False if anything
+    was shed so the caller can count it.
+
+    Cross-language divergence, deliberate and documented: Rust's tokio mpsc has
+    no sender-side pop, so the Rust handler sheds the NEWEST event instead.
+    Both count into the same metric name.
+    """
+    try:
+        q.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        pass
+    try:
+        q.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
     try:
         q.put_nowait(item)
     except asyncio.QueueFull:
-        try:
-            q.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-        try:
-            q.put_nowait(item)
-        except asyncio.QueueFull:
-            pass
+        pass
+    return False
 
 
 # === REST ===
@@ -164,7 +179,7 @@ async def run_shard(shard_id: int, symbols: list[str], books: dict[str, Book],
                     session: aiohttp.ClientSession, bbo_q: asyncio.Queue,
                     book_q: asyncio.Queue, info: dict):
     """Run one WS connection for a subset of symbols. Reconnects forever."""
-    global _bbo_count, _book_count
+    global _bbo_count, _book_count, _bbo_dropped, _book_dropped
     reconnect_delay = RECONNECT_BASE
     sync_tasks: dict[str, asyncio.Task] = {}
 
@@ -227,20 +242,22 @@ async def run_shard(shard_id: int, symbols: list[str], books: dict[str, Book],
                         elif action == "publish":
                             _book_count += 1
                             top_bids, top_asks = book.top_levels()
-                            _put(book_q, {
+                            if not _put(book_q, {
                                 "symbol": symbol, "bids": top_bids, "asks": top_asks,
                                 "last_update_id": book.last_update_id, "ts": time.time(),
-                            })
+                            }):
+                                _book_dropped += 1
 
                     elif evt == "bookTicker":
                         book.set_ticker_bbo(Decimal(msg["b"]), Decimal(msg["a"]))
                         _bbo_count += 1
-                        _put(bbo_q, {
+                        if not _put(bbo_q, {
                             "symbol": symbol,
                             "bid_price": Decimal(msg["b"]), "bid_qty": Decimal(msg["B"]),
                             "ask_price": Decimal(msg["a"]), "ask_qty": Decimal(msg["A"]),
                             "ts": time.time(),
-                        })
+                        }):
+                            _bbo_dropped += 1
 
         except asyncio.CancelledError:
             for t in sync_tasks.values():
@@ -264,46 +281,205 @@ async def run_shard(shard_id: int, symbols: list[str], books: dict[str, Book],
             reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX)
 
 
+# === TELEMETRY ===
+
+# The metric families /metrics exposes. The Rust port renders the same set
+# (feed_handler::METRIC_FAMILIES is the mirror); a serialized metrics contract is
+# cross-language, so both ends move together or not at all.
+METRIC_FAMILIES = [
+    "bfh_up",
+    "bfh_uptime_seconds",
+    "bfh_shards",
+    "bfh_books",
+    "bfh_published_total",
+    "bfh_snapshot_requests_total",
+    "bfh_book_snapshots_total",
+    "bfh_sequence_gaps_total",
+    "bfh_crossed_books_total",
+    "bfh_unverified_bridges_total",
+    "bfh_dropped_total",
+    "bfh_subscribers",
+    "bfh_shard_messages_total",
+    "bfh_shard_latency_ms",
+]
+
+
+@dataclass
+class Telemetry:
+    """One consistent read of everything the observability surfaces report, taken
+    in a single pass over the books. /health, /stats, /metrics and the periodic
+    stats line all derive from this, so they can never disagree -- and a new
+    counter is added in one place instead of four."""
+    uptime_s: int
+    shards: list[dict]
+    connected: int
+    book_states: dict[str, int]
+    live: int
+    total: int
+    gaps: int
+    crossed: int
+    snapshots_per_book: int
+    unverified_bridges: int
+    buffer_dropped: int
+    max_latency_ms: float
+    bbo_published: int
+    book_published: int
+    snapshots: int
+    bbo_dropped: int
+    book_dropped: int
+    subscriber_dropped: int
+    subscribers: int
+
+    @property
+    def healthy(self) -> bool:
+        """Every shard connected and a majority of books live. Same predicate the
+        /health status code is derived from, so a liveness probe and a human
+        reading /health can never draw opposite conclusions."""
+        return self.connected == len(self.shards) and self.live > self.total // 2
+
+    @property
+    def total_dropped(self) -> int:
+        return (self.bbo_dropped + self.book_dropped
+                + self.subscriber_dropped + self.buffer_dropped)
+
+    def book_state(self, state: str) -> int:
+        return self.book_states.get(state, 0)
+
+
+def gather_telemetry(books: dict[str, Book], shard_infos: list[dict],
+                     start_time: float) -> Telemetry:
+    states: dict[str, int] = {}
+    gaps = crossed = snaps_per_book = unverified = buf_dropped = 0
+    for b in books.values():
+        states[b.state] = states.get(b.state, 0) + 1
+        gaps += b.gap_count
+        crossed += b.crossed_count
+        snaps_per_book += b.snapshot_count
+        unverified += b.unverified_bridge_count
+        buf_dropped += b.buffer_dropped
+    latencies = [s["latency_ms"] for s in shard_infos if s["latency_ms"] > 0]
+    return Telemetry(
+        uptime_s=int(time.time() - start_time),
+        shards=shard_infos,
+        connected=sum(1 for s in shard_infos if s["connected"]),
+        book_states=states,
+        live=states.get("live", 0),
+        total=len(books),
+        gaps=gaps,
+        crossed=crossed,
+        snapshots_per_book=snaps_per_book,
+        unverified_bridges=unverified,
+        buffer_dropped=buf_dropped,
+        max_latency_ms=max(latencies) if latencies else 0.0,
+        bbo_published=_bbo_count,
+        book_published=_book_count,
+        snapshots=_snap_count,
+        bbo_dropped=_bbo_dropped,
+        book_dropped=_book_dropped,
+        subscriber_dropped=publisher.dropped_count(),
+        subscribers=publisher.subscriber_count(),
+    )
+
+
+def render_prometheus(t: Telemetry) -> str:
+    """Prometheus text exposition. bfh_sequence_gaps_total and bfh_dropped_total
+    are the two worth alerting on."""
+    out: list[str] = []
+
+    def family(name: str, help_text: str, kind: str, body: str):
+        out.append(f"# HELP {name} {help_text}\n# TYPE {name} {kind}\n{body}")
+
+    family("bfh_up", "1 when every shard is connected and a majority of books are live",
+           "gauge", f"bfh_up {int(t.healthy)}\n")
+    family("bfh_uptime_seconds", "Process uptime", "gauge",
+           f"bfh_uptime_seconds {t.uptime_s}\n")
+    family("bfh_shards", "WebSocket shards by connection state", "gauge",
+           f'bfh_shards{{state="connected"}} {t.connected}\n'
+           f'bfh_shards{{state="disconnected"}} {len(t.shards) - t.connected}\n')
+    family("bfh_books", "Order books by sync state", "gauge",
+           f'bfh_books{{state="live"}} {t.book_state("live")}\n'
+           f'bfh_books{{state="buffering"}} {t.book_state("buffering")}\n'
+           f'bfh_books{{state="uninitialized"}} {t.book_state("uninitialized")}\n')
+    family("bfh_published_total", "Events published downstream", "counter",
+           f'bfh_published_total{{stream="bbo"}} {t.bbo_published}\n'
+           f'bfh_published_total{{stream="book"}} {t.book_published}\n')
+    family("bfh_snapshot_requests_total", "REST depth snapshots requested", "counter",
+           f"bfh_snapshot_requests_total {t.snapshots}\n")
+    family("bfh_book_snapshots_total", "Snapshots successfully applied to a book",
+           "counter", f"bfh_book_snapshots_total {t.snapshots_per_book}\n")
+    family("bfh_sequence_gaps_total", "Depth sequence gaps detected (pu chain broken)",
+           "counter", f"bfh_sequence_gaps_total {t.gaps}\n")
+    family("bfh_crossed_books_total", "Integrity failures where bid >= ask", "counter",
+           f"bfh_crossed_books_total {t.crossed}\n")
+    family("bfh_unverified_bridges_total",
+           "Snapshots that went live without a buffered event proving "
+           "U <= lastUpdateId <= u", "counter",
+           f"bfh_unverified_bridges_total {t.unverified_bridges}\n")
+    family("bfh_dropped_total", "Messages shed, by shedding point", "counter",
+           f'bfh_dropped_total{{queue="bbo"}} {t.bbo_dropped}\n'
+           f'bfh_dropped_total{{queue="book"}} {t.book_dropped}\n'
+           f'bfh_dropped_total{{queue="subscriber"}} {t.subscriber_dropped}\n'
+           f'bfh_dropped_total{{queue="resync_buffer"}} {t.buffer_dropped}\n')
+    family("bfh_subscribers", "Connected downstream subscribers", "gauge",
+           f"bfh_subscribers {t.subscribers}\n")
+    family("bfh_shard_messages_total", "WebSocket messages received per shard",
+           "counter",
+           "".join(f'bfh_shard_messages_total{{shard="{s["id"]}"}} {s["msg_count"]}\n'
+                   for s in t.shards))
+    family("bfh_shard_latency_ms", "Event-time to receive-time lag per shard", "gauge",
+           "".join(f'bfh_shard_latency_ms{{shard="{s["id"]}"}} {s["latency_ms"]:.1f}\n'
+                   for s in t.shards))
+    return "".join(out)
+
+
 # === HEALTH ===
 
 async def start_health_server(books: dict[str, Book], shard_infos: list[dict],
                               port: int, start_time: float):
-    """HTTP health + stats endpoints using aiohttp."""
+    """HTTP health + stats + metrics endpoints using aiohttp."""
     from aiohttp import web
 
     async def health_handler(_req):
-        connected = sum(1 for s in shard_infos if s["connected"])
-        live = sum(1 for b in books.values() if b.state == "live")
-        total = len(books)
-        healthy = connected == len(shard_infos) and live > total * 0.5
+        t = gather_telemetry(books, shard_infos, start_time)
         return web.json_response({
-            "healthy": healthy,
-            "uptime_s": int(time.time() - start_time),
-            "shards": f"{connected}/{len(shard_infos)} connected",
-            "books": f"{live}/{total} live",
-        }, status=200 if healthy else 503)
+            "healthy": t.healthy,
+            "uptime_s": t.uptime_s,
+            "shards": f"{t.connected}/{len(t.shards)} connected",
+            "books": f"{t.live}/{t.total} live",
+        }, status=200 if t.healthy else 503)
 
     async def stats_handler(_req):
-        states = {}
-        for b in books.values():
-            states[b.state] = states.get(b.state, 0) + 1
-        latencies = [s["latency_ms"] for s in shard_infos if s["latency_ms"] > 0]
+        t = gather_telemetry(books, shard_infos, start_time)
         return web.json_response({
-            "uptime_s": int(time.time() - start_time),
-            "book_states": states,
-            "shards": shard_infos,
-            "bbo_published": _bbo_count,
-            "book_published": _book_count,
-            "snapshots": _snap_count,
-            "total_gaps": sum(b.gap_count for b in books.values()),
-            "total_crossed": sum(b.crossed_count for b in books.values()),
-            "total_snapshots_per_book": sum(b.snapshot_count for b in books.values()),
-            "max_latency_ms": max(latencies) if latencies else 0.0,
+            "uptime_s": t.uptime_s,
+            "book_states": t.book_states,
+            "shards": t.shards,
+            "bbo_published": t.bbo_published,
+            "book_published": t.book_published,
+            "snapshots": t.snapshots,
+            "total_gaps": t.gaps,
+            "total_crossed": t.crossed,
+            "total_snapshots_per_book": t.snapshots_per_book,
+            "total_unverified_bridges": t.unverified_bridges,
+            "max_latency_ms": t.max_latency_ms,
+            "dropped": {
+                "bbo_queue": t.bbo_dropped,
+                "book_queue": t.book_dropped,
+                "subscriber_queue": t.subscriber_dropped,
+                "book_buffer": t.buffer_dropped,
+            },
+            "subscribers": t.subscribers,
         })
+
+    async def metrics_handler(_req):
+        body = render_prometheus(gather_telemetry(books, shard_infos, start_time))
+        return web.Response(text=body, content_type="text/plain",
+                            headers={"content-type": "text/plain; version=0.0.4"})
 
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/stats", stats_handler)
+    app.router.add_get("/metrics", metrics_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
@@ -311,22 +487,19 @@ async def start_health_server(books: dict[str, Book], shard_infos: list[dict],
 
 # === MONITORING ===
 
-async def log_stats(books: dict[str, Book], shard_infos: list[dict]):
+async def log_stats(books: dict[str, Book], shard_infos: list[dict],
+                    start_time: float):
     while True:
         await asyncio.sleep(STATS_INTERVAL)
-        live = sum(1 for b in books.values() if b.state == "live")
-        buffering = sum(1 for b in books.values() if b.state == "buffering")
-        connected = sum(1 for s in shard_infos if s["connected"])
-        total_msgs = sum(s["msg_count"] for s in shard_infos)
-        latencies = [s["latency_ms"] for s in shard_infos if s["latency_ms"] > 0]
-        max_lat = max(latencies) if latencies else 0.0
-        total_gaps = sum(b.gap_count for b in books.values())
-        total_crossed = sum(b.crossed_count for b in books.values())
+        t = gather_telemetry(books, shard_infos, start_time)
         logger.info(
             "shards=%d/%d | books: %d live, %d buffering | msgs=%d | "
-            "pub: %d bbo, %d book | snaps=%d | latency=%.0fms | gaps=%d crossed=%d",
-            connected, len(shard_infos), live, buffering, total_msgs,
-            _bbo_count, _book_count, _snap_count, max_lat, total_gaps, total_crossed,
+            "pub: %d bbo, %d book | snaps=%d | latency=%.0fms | "
+            "gaps=%d crossed=%d dropped=%d",
+            t.connected, len(t.shards), t.book_state("live"), t.book_state("buffering"),
+            sum(s["msg_count"] for s in t.shards),
+            t.bbo_published, t.book_published, t.snapshots, t.max_latency_ms,
+            t.gaps, t.crossed, t.total_dropped,
         )
 
 
@@ -424,7 +597,7 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
 
         bg_tasks = [
             asyncio.create_task(publisher.run_dispatcher(bbo_q, book_q)),
-            asyncio.create_task(log_stats(books, shard_infos)),
+            asyncio.create_task(log_stats(books, shard_infos, start_time)),
             asyncio.create_task(check_stale(books, session)),
             asyncio.create_task(demo_consumer()),
         ]
