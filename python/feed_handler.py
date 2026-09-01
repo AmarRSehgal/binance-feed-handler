@@ -175,13 +175,6 @@ async def run_shard(shard_id: int, symbols: list[str], books: dict[str, Book],
 
     while True:
         try:
-            # Reset books so they re-sync from snapshot on reconnect
-            for sym in symbols:
-                books[sym].reset()
-            for t in sync_tasks.values():
-                t.cancel()
-            sync_tasks.clear()
-
             stream_names = []
             for sym in symbols:
                 s = sym.lower()
@@ -255,6 +248,15 @@ async def run_shard(shard_id: int, symbols: list[str], books: dict[str, Book],
             break
         except Exception as e:
             info["connected"] = False
+            # Unsync every book the moment the socket dies, not at the top of the
+            # next connect attempt: reconnect backoff runs up to 30s, and a book
+            # reported "live" during that window is a book whose depth is frozen.
+            # This also re-arms the state machine before we re-subscribe.
+            for sym in symbols:
+                books[sym].reset()
+            for t in sync_tasks.values():
+                t.cancel()
+            sync_tasks.clear()
             jittered = reconnect_delay + random.uniform(0, 1.0)
             logger.error("Shard %d: disconnected (%s). Reconnecting in %.1fs",
                          shard_id, e, jittered)
