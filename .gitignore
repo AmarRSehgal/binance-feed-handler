@@ -8,7 +8,8 @@ tests/expected_outputs.json
 
 # Rust
 rust/target/
-rust/Cargo.lock
+# Cargo.lock IS tracked: this crate ships a binary, so the lockfile is what makes
+# a build reproducible. Only libraries leave it out.
 
 # macOS
 .DS_Store
