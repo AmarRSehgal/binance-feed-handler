@@ -33,13 +33,11 @@ pub enum Action {
     None_,
 }
 
-type BufferedEvent = (
-    u64,
-    u64,
-    u64,
-    Vec<(Decimal, Decimal)>,
-    Vec<(Decimal, Decimal)>,
-);
+/// (price, qty) levels for one side of the book.
+pub type Levels = Vec<(Decimal, Decimal)>;
+
+/// A buffered depth diff: (U, u, pu, bids, asks).
+type BufferedEvent = (u64, u64, u64, Levels, Levels);
 
 /// One symbol's L2 order book, synced via depth diffs + REST snapshots.
 ///
@@ -56,6 +54,12 @@ pub struct Book {
     pub snapshot_count: u64,
     pub gap_count: u64,
     pub crossed_count: u64,
+    /// Diffs shed because the resync buffer hit BUFFER_MAX. Non-zero means a
+    /// snapshot took so long we lost events we might have needed to replay.
+    pub buffer_dropped: u64,
+    /// Snapshots where the documented bridge (`U <= lastUpdateId <= u`) could
+    /// not be proven because no buffered event straddled the snapshot.
+    pub unverified_bridge_count: u64,
     buffer: VecDeque<BufferedEvent>,
     need_first_event: bool,
     ticker_bid: Decimal,
@@ -76,6 +80,8 @@ impl Book {
             snapshot_count: 0,
             gap_count: 0,
             crossed_count: 0,
+            buffer_dropped: 0,
+            unverified_bridge_count: 0,
             need_first_event: false,
             ticker_bid: Decimal::ZERO,
             ticker_ask: Decimal::ZERO,
@@ -112,10 +118,13 @@ impl Book {
                 }
 
                 if self.need_first_event {
-                    // Binance Futures uses global update IDs shared across all symbols.
-                    // After a snapshot, the first depth event for THIS symbol often has
-                    // U > snapshot.lastUpdateId because other symbols' events filled the
-                    // gap. Safe to apply -- no depth changes for this symbol were missed.
+                    // Only set when NO buffered event straddled the snapshot, so there
+                    // is nothing to chain pu against: last_update_id is a REST
+                    // lastUpdateId, not a stream 'u'. Binance Futures draws U/u/pu from
+                    // a venue-wide counter, so pu here belongs to a different point in
+                    // the global sequence and comparing it would false-positive. Accept
+                    // once, then the normal pu chain takes over. Counted as
+                    // unverified_bridge_count.
                     self.need_first_event = false;
                 } else if pu != self.last_update_id {
                     self.gap_count += 1;
@@ -123,14 +132,14 @@ impl Book {
                         "{}: sequence gap (expected pu={}, got {}) [#{}]",
                         self.symbol, self.last_update_id, pu, self.gap_count
                     );
-                    self.to_buffering(U, u, pu, bids, asks);
+                    self.fall_back_to_buffering(U, u, pu, bids, asks);
                     return Action::NeedSnapshot;
                 }
 
                 self.apply_diff(&bids, &asks, u);
 
                 if !self.check_integrity() {
-                    self.to_buffering(U, u, pu, bids, asks);
+                    self.fall_back_to_buffering(U, u, pu, bids, asks);
                     return Action::NeedSnapshot;
                 }
 
@@ -170,11 +179,24 @@ impl Book {
         let mut applied_any = false;
         // Drain the buffer into a local vec to avoid borrow issues.
         let buffered: Vec<_> = self.buffer.drain(..).collect();
-        for (_, buf_u, buf_pu, buf_bids, buf_asks) in &buffered {
+        for (buf_big_u, buf_u, buf_pu, buf_bids, buf_asks) in &buffered {
             if *buf_u < last_update_id {
                 continue;
             }
-            if applied_any && *buf_pu != self.last_update_id {
+            if !applied_any {
+                // Binance's documented bridge: the first replayed event must
+                // straddle the snapshot (U <= lastUpdateId <= u). u >= lui is
+                // already true here, so only U needs checking. If U > lui the
+                // diffs covering (lui, U) are gone -- going live now would
+                // silently serve a book with a hole, so reject and re-snapshot.
+                if *buf_big_u > last_update_id {
+                    warn!(
+                        "{}: snapshot bridge broken (U={} > lastUpdateId={}), re-snapshotting",
+                        self.symbol, buf_big_u, last_update_id
+                    );
+                    return false;
+                }
+            } else if *buf_pu != self.last_update_id {
                 debug!("{}: pu gap in buffer during sync", self.symbol);
                 return false;
             }
@@ -183,7 +205,14 @@ impl Book {
         }
 
         self.state = BookState::Live;
+        // No buffered event straddled the snapshot, so the bridge is unproven.
+        // We accept the next live event without a pu check (Binance Futures
+        // draws U/u from a venue-wide counter, so pu will not line up with a
+        // REST lastUpdateId). Counted so this stays visible rather than silent.
         self.need_first_event = !applied_any;
+        if !applied_any {
+            self.unverified_bridge_count += 1;
+        }
         self.bbo_mismatch_count = 0;
 
         if !self.check_integrity() {
@@ -220,9 +249,9 @@ impl Book {
     }
 
     /// Return the top `n` bid and ask levels, sorted best-first.
-    pub fn top_levels(&self, n: usize) -> (Vec<(Decimal, Decimal)>, Vec<(Decimal, Decimal)>) {
+    pub fn top_levels(&self, n: usize) -> (Levels, Levels) {
         // BTreeMap is ascending. Best bids are the highest prices (take from the end).
-        let top_bids: Vec<(Decimal, Decimal)> = self
+        let top_bids: Levels = self
             .bids
             .iter()
             .rev()
@@ -231,7 +260,7 @@ impl Book {
             .collect();
 
         // Best asks are the lowest prices (take from the start).
-        let top_asks: Vec<(Decimal, Decimal)> =
+        let top_asks: Levels =
             self.asks.iter().take(n).map(|(&p, &q)| (p, q)).collect();
 
         (top_bids, top_asks)
@@ -297,7 +326,7 @@ impl Book {
         true
     }
 
-    fn to_buffering(
+    fn fall_back_to_buffering(
         &mut self,
         #[allow(non_snake_case)] U: u64,
         u: u64,
@@ -312,9 +341,12 @@ impl Book {
     }
 
     /// Push an event into the buffer, dropping the oldest if at capacity.
+    /// Drops are counted -- losing the oldest buffered diff can break the
+    /// snapshot bridge, so this must never be silent.
     fn buffer_push(&mut self, event: BufferedEvent) {
         if self.buffer.len() >= BUFFER_MAX {
             self.buffer.pop_front();
+            self.buffer_dropped += 1;
         }
         self.buffer.push_back(event);
     }
@@ -477,5 +509,155 @@ mod tests {
         b.on_depth(11, 20, 10, vec![], vec![]);
         b.on_depth(50, 60, 40, vec![], vec![]);
         assert!(!b.on_snapshot(15, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")])));
+    }
+
+    #[test]
+    fn test_events_during_buffering_are_queued() {
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        let result = b.on_depth(11, 20, 10, vec![], vec![]);
+        assert_eq!(result, Action::None_);
+    }
+
+    #[test]
+    fn test_snapshot_skips_old_buffered_events() {
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 3, 0, make_levels(&[("50", "1")]), vec![]);
+        b.on_depth(4, 10, 3, make_levels(&[("99", "2")]), vec![]);
+        b.on_snapshot(8, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")]));
+        assert_eq!(b.state, BookState::Live);
+        assert!(!b.bids.contains_key(&dec!(50)));
+        assert_eq!(b.bids.get(&dec!(99)), Some(&dec!(2)));
+    }
+
+    #[test]
+    fn test_first_event_after_snapshot_when_buffer_applied() {
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        b.on_depth(11, 20, 10, vec![], vec![]);
+        b.on_snapshot(5, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")]));
+        assert_eq!(b.state, BookState::Live);
+        let result = b.on_depth(21, 30, 20, make_levels(&[("99", "1")]), vec![]);
+        assert_eq!(result, Action::Publish);
+    }
+
+    #[test]
+    fn test_zero_qty_in_snapshot_excluded() {
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        b.on_snapshot(
+            5,
+            &make_levels(&[("100", "0"), ("99", "1")]),
+            &make_levels(&[("101", "0"), ("102", "1")]),
+        );
+        assert!(!b.bids.contains_key(&dec!(100)));
+        assert!(!b.asks.contains_key(&dec!(101)));
+    }
+
+    #[test]
+    fn test_bbo_mismatch_below_threshold_passes() {
+        let mut b = make_live_book(None, None);
+        b.set_ticker_bbo(dec!(99), dec!(102));
+        let result = b.on_depth(111, 120, 110, vec![], vec![]);
+        assert_eq!(b.state, BookState::Live);
+        assert_eq!(result, Action::Publish);
+    }
+
+    #[test]
+    fn test_bbo_match_resets_mismatch_counter() {
+        let mut b = make_live_book(None, None);
+        b.set_ticker_bbo(dec!(99), dec!(102));
+        b.on_depth(111, 120, 110, vec![], vec![]);
+        b.set_ticker_bbo(dec!(100), dec!(101));
+        b.on_depth(121, 130, 120, vec![], vec![]);
+        assert_eq!(b.state, BookState::Live);
+    }
+
+    #[test]
+    fn test_empty_book_passes_integrity() {
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        b.on_snapshot(5, &[], &[]);
+        assert_eq!(b.state, BookState::Live);
+    }
+
+    #[test]
+    fn test_reset_allows_full_resync() {
+        let mut b = make_live_book(None, None);
+        b.reset();
+        let result = b.on_depth(200, 210, 190, vec![], vec![]);
+        assert_eq!(result, Action::NeedSnapshot);
+        assert_eq!(b.state, BookState::Buffering);
+    }
+
+    #[test]
+    fn test_snapshot_when_live_is_noop() {
+        let mut b = make_live_book(None, None);
+        let original_bid_count = b.bids.len();
+        assert!(b.on_snapshot(
+            999,
+            &make_levels(&[("50", "1")]),
+            &make_levels(&[("51", "1")]),
+        ));
+        assert_eq!(b.bids.len(), original_bid_count);
+    }
+
+    #[test]
+    fn test_multiple_gaps_increment_counter() {
+        let mut b = make_live_book(None, None);
+        b.on_depth(201, 210, 200, vec![], vec![]);
+        assert_eq!(b.gap_count, 1);
+        b.on_snapshot(
+            300,
+            &make_levels(&[("100", "1")]),
+            &make_levels(&[("101", "1")]),
+        );
+        b.on_depth(301, 310, 300, vec![], vec![]);
+        b.on_depth(401, 410, 400, vec![], vec![]);
+        assert_eq!(b.gap_count, 2);
+    }
+
+    // --- snapshot bridge / drop accounting ---
+
+    #[test]
+    fn test_snapshot_bridge_broken_is_rejected() {
+        // Buffer's first replayable event starts AFTER the snapshot, so the
+        // diffs covering (lastUpdateId, U) are gone. Must not go live.
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(200, 210, 190, make_levels(&[("99", "1")]), vec![]);
+        assert!(!b.on_snapshot(100, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")])));
+        assert_eq!(b.state, BookState::Buffering);
+        assert!(!b.bids.contains_key(&dec!(99)));
+    }
+
+    #[test]
+    fn test_snapshot_bridge_straddling_event_is_accepted() {
+        // U <= lastUpdateId <= u: the documented bridge holds, so go live.
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(90, 210, 89, make_levels(&[("99", "1")]), vec![]);
+        assert!(b.on_snapshot(100, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")])));
+        assert_eq!(b.state, BookState::Live);
+        assert_eq!(b.bids.get(&dec!(99)), Some(&dec!(1)));
+        assert_eq!(b.unverified_bridge_count, 0);
+    }
+
+    #[test]
+    fn test_unverified_bridge_is_counted() {
+        // Snapshot is newer than everything buffered: nothing straddles it, so
+        // the bridge is unproven and we fall back to accepting the next event.
+        let mut b = Book::new("TEST".to_string());
+        b.on_depth(1, 10, 0, vec![], vec![]);
+        assert!(b.on_snapshot(100, &make_levels(&[("100", "1")]), &make_levels(&[("101", "1")])));
+        assert_eq!(b.state, BookState::Live);
+        assert_eq!(b.unverified_bridge_count, 1);
+    }
+
+    #[test]
+    fn test_buffer_overflow_drops_are_counted() {
+        let mut b = Book::new("TEST".to_string());
+        for i in 0..(BUFFER_MAX as u64 + 7) {
+            b.on_depth(i * 10 + 1, i * 10 + 10, i * 10, vec![], vec![]);
+        }
+        assert_eq!(b.buffer_dropped, 7);
     }
 }
