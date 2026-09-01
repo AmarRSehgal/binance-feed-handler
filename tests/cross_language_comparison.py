@@ -196,10 +196,150 @@ def normalize(obj):
     return json.loads(json.dumps(obj, sort_keys=True, default=str))
 
 
+# === DIFFERENTIAL FUZZ ===
+#
+# The generator below is a byte-for-byte mirror of the `fuzz` module in
+# rust/src/main.rs: same LCG, same constants, same branch thresholds, so both
+# implementations see an identical event script for a given seed and any
+# behavioural divergence shows up as a digest mismatch.
+#
+# Hand-written scenarios only cover the transitions someone thought to write
+# down. This covers the interleavings nobody would: a snapshot landing behind the
+# buffer, a reset mid-resync, a stale event straddling a gap.
+
+BID_PRICES = ["100", "99", "98"]
+ASK_PRICES = ["101", "102", "103"]
+_U64 = (1 << 64) - 1
+
+
+class Lcg:
+    __slots__ = ("state",)
+
+    def __init__(self, seed: int):
+        self.state = seed
+
+    def next(self) -> int:
+        self.state = (self.state * 6364136223846793005 + 1442695040888963407) & _U64
+        return self.state >> 33
+
+    def below(self, n: int) -> int:
+        return self.next() % n
+
+
+def _levels(rng: Lcg, prices: list[str]) -> list[tuple[Decimal, Decimal]]:
+    out = []
+    for _ in range(rng.below(3)):
+        price = prices[rng.below(3)]
+        # A zero qty is a level delete -- the most common real diff.
+        qty = "0" if rng.below(4) == 0 else str(rng.below(9) + 1)
+        out.append((Decimal(price), Decimal(qty)))
+    return out
+
+
+def _digest(step: int, op: str, action, b: Book) -> dict:
+    top_bids, top_asks = b.top_levels(3)
+    return {
+        "step": step,
+        "op": op,
+        "action": action,
+        "state": b.state,
+        "last_update_id": b.last_update_id,
+        "bids": len(b.bids),
+        "asks": len(b.asks),
+        "top_bids": [[str(p), str(q)] for p, q in top_bids],
+        "top_asks": [[str(p), str(q)] for p, q in top_asks],
+        "gaps": b.gap_count,
+        "crossed": b.crossed_count,
+        "snapshots": b.snapshot_count,
+        "unverified_bridges": b.unverified_bridge_count,
+        "buffer_dropped": b.buffer_dropped,
+    }
+
+
+def run_fuzz(seed: int, steps: int = 2000) -> dict:
+    rng = Lcg(seed)
+    b = Book("FUZZUSDT")
+    seq = 1000
+    out = []
+
+    for step in range(steps):
+        roll = rng.below(100)
+        if roll < 55 or 65 <= roll < 78:
+            # Contiguous diff, or one that deliberately skips the sequence.
+            skip = 0 if roll < 55 else 10 * (1 + rng.below(5))
+            bids = _levels(rng, BID_PRICES)
+            asks = _levels(rng, ASK_PRICES)
+            big_u, u, pu = seq + skip + 1, seq + skip + 10, seq + skip
+            seq = u
+            action = b.on_depth(big_u, u, pu, bids, asks)
+            out.append(_digest(step, "depth" if skip == 0 else "depth_gap", action, b))
+        elif roll < 88:
+            r = rng.below(3)
+            if r == 0:
+                lui = seq
+            elif r == 1:
+                lui = seq + 10 * (1 + rng.below(3))
+            else:
+                lui = max(0, seq - 10 * (1 + rng.below(3)))
+            bids = _levels(rng, BID_PRICES)
+            asks = _levels(rng, ASK_PRICES)
+            ok = b.on_snapshot(lui, bids, asks)
+            out.append(_digest(step, "snapshot", "live" if ok else "retry", b))
+        elif roll < 93:
+            # A stale replay: u is far behind last_update_id.
+            out.append(_digest(step, "stale", b.on_depth(1, 2, 0, [], []), b))
+        elif roll < 96:
+            b.reset()
+            out.append(_digest(step, "reset", None, b))
+        elif roll < 98:
+            b.mark_for_resync()
+            out.append(_digest(step, "mark_for_resync", None, b))
+        else:
+            b.set_ticker_bbo(Decimal(BID_PRICES[rng.below(3)]),
+                             Decimal(ASK_PRICES[rng.below(3)]))
+            out.append(_digest(step, "ticker", None, b))
+
+    return {"seed": seed, "steps": steps, "digest": out}
+
+
+def compare_fuzz(rust_binary: str, seeds: list[int], steps: int) -> bool:
+    """Run the same fuzz script through both implementations and diff the digests."""
+    all_ok = True
+    for seed in seeds:
+        expected = run_fuzz(seed, steps)
+        proc = subprocess.run(
+            [rust_binary, "--test-fuzz", str(seed), "--test-fuzz-steps", str(steps)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            print(f"  seed {seed}: RUST FAILED\n{proc.stderr}")
+            all_ok = False
+            continue
+        actual = json.loads(proc.stdout)
+        if actual == expected:
+            print(f"  seed {seed} ({steps} steps): MATCH")
+            continue
+        all_ok = False
+        mismatches = [
+            (e, a) for e, a in zip(expected["digest"], actual["digest"]) if e != a
+        ]
+        print(f"  seed {seed}: MISMATCH at {len(mismatches)} of {steps} steps")
+        for e, a in mismatches[:3]:
+            print(f"    step {e['step']} op={e['op']}")
+            for k in e:
+                if e[k] != a.get(k):
+                    print(f"      {k}: python={e[k]!r} rust={a.get(k)!r}")
+    return all_ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cross-language comparison test")
     parser.add_argument("--rust-binary", type=str, default=None,
                         help="Path to Rust binary (build with: cd rust && cargo build)")
+    parser.add_argument("--fuzz-seeds", type=int, default=8,
+                        help="Differential fuzz seeds to compare (0 to skip)")
+    parser.add_argument("--fuzz-steps", type=int, default=2000,
+                        help="Event-script length per fuzz seed")
     args = parser.parse_args()
 
     py_results = run_all()
@@ -240,12 +380,18 @@ def main():
             print(f"    Rust:   {json.dumps(rs_norm, sort_keys=True)}")
             all_match = False
 
+    if args.fuzz_seeds:
+        print(f"\nDifferential fuzz ({args.fuzz_seeds} seeds x {args.fuzz_steps} steps):")
+        if not compare_fuzz(args.rust_binary, list(range(1, args.fuzz_seeds + 1)),
+                            args.fuzz_steps):
+            all_match = False
+
     if all_match:
-        print(f"\nAll {len(py_results)} scenarios match between Python and Rust.")
+        print(f"\nAll {len(py_results)} scenarios and every fuzz seed match "
+              "between Python and Rust.")
         return 0
-    else:
-        print("\nSome scenarios differ.")
-        return 1
+    print("\nPython and Rust diverge -- see above.")
+    return 1
 
 
 if __name__ == "__main__":

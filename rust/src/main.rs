@@ -41,6 +41,15 @@ struct Args {
 
     #[arg(long, help = "Run cross-language comparison scenarios and print JSON")]
     test_scenarios: bool,
+
+    #[arg(
+        long,
+        help = "Run the differential fuzz script for this seed and print a per-step JSON digest"
+    )]
+    test_fuzz: Option<u64>,
+
+    #[arg(long, default_value = "2000", help = "Steps for --test-fuzz")]
+    test_fuzz_steps: usize,
 }
 
 #[tokio::main]
@@ -50,6 +59,12 @@ async fn main() -> anyhow::Result<()> {
     if args.test_scenarios {
         let output = scenarios::run_all();
         println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    if let Some(seed) = args.test_fuzz {
+        let output = fuzz::run(seed, args.test_fuzz_steps);
+        println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
 
@@ -251,5 +266,140 @@ mod scenarios {
             "reset_and_resync": scenario_reset_and_resync(),
             "top_levels_ordering": scenario_top_levels_ordering(),
         })
+    }
+}
+
+/// Differential fuzz driver. The generator below is a byte-for-byte mirror of
+/// `tests/cross_language_comparison.py`'s: same LCG, same constants, same branch
+/// thresholds, so both implementations see an identical event script for a given
+/// seed and any behavioural divergence shows up as a digest mismatch.
+///
+/// Hand-written scenarios only cover the transitions someone thought to write
+/// down. This covers the interleavings nobody would: a snapshot landing behind
+/// the buffer, a reset mid-resync, a stale event straddling a gap.
+mod fuzz {
+    use binance_feed_handler::book::{Book, BookState};
+    use rust_decimal::Decimal;
+    use serde_json::{json, Value};
+
+    const BID_PRICES: [&str; 3] = ["100", "99", "98"];
+    const ASK_PRICES: [&str; 3] = ["101", "102", "103"];
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn levels(rng: &mut Lcg, prices: &[&str; 3]) -> Vec<(Decimal, Decimal)> {
+        let n = rng.below(3);
+        (0..n)
+            .map(|_| {
+                let price = prices[rng.below(3) as usize];
+                // A zero qty is a level delete -- the most common real diff.
+                let qty = if rng.below(4) == 0 {
+                    "0".to_string()
+                } else {
+                    (rng.below(9) + 1).to_string()
+                };
+                (price.parse().unwrap(), qty.parse().unwrap())
+            })
+            .collect()
+    }
+
+    fn state_str(b: &Book) -> &'static str {
+        match b.state {
+            BookState::Uninitialized => "uninitialized",
+            BookState::Buffering => "buffering",
+            BookState::Live => "live",
+        }
+    }
+
+    fn digest(step: usize, op: &str, action: Option<&str>, b: &Book) -> Value {
+        let (top_bids, top_asks) = b.top_levels(3);
+        json!({
+            "step": step,
+            "op": op,
+            "action": action,
+            "state": state_str(b),
+            "last_update_id": b.last_update_id,
+            "bids": b.bids.len(),
+            "asks": b.asks.len(),
+            "top_bids": top_bids.iter().map(|(p, q)| json!([p.to_string(), q.to_string()])).collect::<Vec<_>>(),
+            "top_asks": top_asks.iter().map(|(p, q)| json!([p.to_string(), q.to_string()])).collect::<Vec<_>>(),
+            "gaps": b.gap_count,
+            "crossed": b.crossed_count,
+            "snapshots": b.snapshot_count,
+            "unverified_bridges": b.unverified_bridge_count,
+            "buffer_dropped": b.buffer_dropped,
+        })
+    }
+
+    pub fn run(seed: u64, steps: usize) -> Value {
+        let mut rng = Lcg(seed);
+        let mut b = Book::new("FUZZUSDT".to_string());
+        let mut seq: u64 = 1000;
+        let mut out = Vec::with_capacity(steps);
+
+        for step in 0..steps {
+            let roll = rng.below(100);
+            if roll < 55 || (65..78).contains(&roll) {
+                // Contiguous diff, or one that deliberately skips the sequence.
+                let skip = if roll < 55 { 0 } else { 10 * (1 + rng.below(5)) };
+                let bids = levels(&mut rng, &BID_PRICES);
+                let asks = levels(&mut rng, &ASK_PRICES);
+                let (big_u, u, pu) = (seq + skip + 1, seq + skip + 10, seq + skip);
+                seq = u;
+                let action = b.on_depth(big_u, u, pu, bids, asks);
+                let name = match action {
+                    binance_feed_handler::book::Action::Publish => Some("publish"),
+                    binance_feed_handler::book::Action::NeedSnapshot => Some("need_snapshot"),
+                    binance_feed_handler::book::Action::None_ => None,
+                };
+                out.push(digest(step, if skip == 0 { "depth" } else { "depth_gap" }, name, &b));
+            } else if roll < 88 {
+                let lui = match rng.below(3) {
+                    0 => seq,
+                    1 => seq + 10 * (1 + rng.below(3)),
+                    _ => seq.saturating_sub(10 * (1 + rng.below(3))),
+                };
+                let bids = levels(&mut rng, &BID_PRICES);
+                let asks = levels(&mut rng, &ASK_PRICES);
+                let ok = b.on_snapshot(lui, &bids, &asks);
+                out.push(digest(step, "snapshot", Some(if ok { "live" } else { "retry" }), &b));
+            } else if roll < 93 {
+                // A stale replay: u is far behind last_update_id.
+                let action = b.on_depth(1, 2, 0, vec![], vec![]);
+                let name = match action {
+                    binance_feed_handler::book::Action::Publish => Some("publish"),
+                    binance_feed_handler::book::Action::NeedSnapshot => Some("need_snapshot"),
+                    binance_feed_handler::book::Action::None_ => None,
+                };
+                out.push(digest(step, "stale", name, &b));
+            } else if roll < 96 {
+                b.reset();
+                out.push(digest(step, "reset", None, &b));
+            } else if roll < 98 {
+                b.mark_for_resync();
+                out.push(digest(step, "mark_for_resync", None, &b));
+            } else {
+                let bid: Decimal = BID_PRICES[rng.below(3) as usize].parse().unwrap();
+                let ask: Decimal = ASK_PRICES[rng.below(3) as usize].parse().unwrap();
+                b.set_ticker_bbo(bid, ask);
+                out.push(digest(step, "ticker", None, &b));
+            }
+        }
+
+        json!({"seed": seed, "steps": steps, "digest": out})
     }
 }

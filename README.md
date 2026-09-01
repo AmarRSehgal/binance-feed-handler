@@ -58,16 +58,19 @@ Same CLI flags, same WebSocket protocol, same ports.
 ### Tests
 
 ```bash
-# Python (38 tests)
+# Python (52 tests)
 pip install -r python/requirements-dev.txt
 python -m pytest tests/python/ -v
 
-# Rust (27 tests)
+# Rust (39 unit + 1 end-to-end reconnect/resync test against a mock venue)
 cd rust && cargo test && cd ..
 
-# Cross-language comparison (5 deterministic scenarios, diffs every field)
+# Cross-language: 5 deterministic scenarios + a differential fuzzer that drives
+# both implementations through an identical LCG-generated event script
 cd rust && cargo build && cd ..
 python tests/cross_language_comparison.py --rust-binary rust/target/debug/binance-feed-handler
+python tests/cross_language_comparison.py --rust-binary rust/target/debug/binance-feed-handler \
+    --fuzz-seeds 40 --fuzz-steps 8000
 ```
 
 ## Design decisions
@@ -103,7 +106,7 @@ The `need_first_event` escape hatch survives only for the case where the bridge 
 | Sequence gap | `pu != last_update_id` | Fall back to buffering, re-snapshot |
 | Crossed book | `best_bid >= best_ask` | Fall back to buffering, re-snapshot |
 | BBO divergence | 10 consecutive mismatches vs bookTicker | Fall back to buffering, re-snapshot |
-| Stale book | No update in 30s | Reset, re-sync from scratch |
+| Stale book | No update in 30s | Re-enter buffering and request a snapshot immediately |
 
 ## Observability
 
@@ -112,11 +115,13 @@ Stats line every 10s:
 shards=6/6 | books: 568 live, 2 buffering | msgs=184920 | pub: 92100 bbo, 45300 book | snaps=570 | latency=45ms | gaps=0 crossed=0 dropped=0
 ```
 
-`/health` reports `healthy: true` when all shards are connected and >50% of books are live. Note it always answers HTTP 200 -- the verdict is the `healthy` field in the body, so a probe must read the JSON, not just the status code. `/stats` returns the full breakdown as JSON, including per-queue `dropped` counters and the live `subscribers` count.
+`/health` answers **200 when healthy and 503 when not** (all shards connected and >50% of books live), so an orchestrator probe can act on the status code alone. `/stats` returns the full breakdown as JSON, including per-queue `dropped` counters, `total_unverified_bridges`, and the live `subscribers` count. `/metrics` exposes the same numbers in Prometheus text format; `bfh_sequence_gaps_total` and `bfh_dropped_total` are the two worth alerting on.
+
+All four surfaces (`/health`, `/stats`, `/metrics`, the stats line) derive from a single telemetry snapshot taken in one pass over the books, so they cannot disagree with each other.
 
 ## Known limitations / what I'd do with more time
 
-- **No Prometheus/OTLP metrics.** Stats are JSON-over-HTTP. Production would use histogram latencies and alertable counters.
+- **Latency is a last-value gauge, not a histogram.** `/metrics` exposes alertable counters, but per-shard latency is the most recent sample rather than a percentile distribution. Production wants a histogram.
 - **No warm standby connections.** On disconnect, there's a cold reconnect + re-subscribe + re-snapshot cycle. Shadow connections pre-buffering would give instant failover.
 - **No snapshot prioritization.** All symbols snapshot in arrival order. High-volume symbols (BTC, ETH) should go first.
 - **No message compression.** `permessage-deflate` would cut bandwidth at the cost of CPU.

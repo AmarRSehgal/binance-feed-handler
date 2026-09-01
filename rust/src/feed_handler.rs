@@ -731,7 +731,31 @@ async fn stats_handler(State(state): State<AppState>) -> Json<Value> {
 /// scraper can alert on -- `bfh_sequence_gaps_total` and `bfh_dropped_total` are
 /// the two worth paging on.
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let t = Telemetry::gather(&state).await;
+    let body = render_prometheus(&Telemetry::gather(&state).await);
+    ([("content-type", "text/plain; version=0.0.4")], body)
+}
+
+/// The metric-family names this handler exposes. The Python port renders the
+/// same set (`tests/python/test_metrics.py` holds the mirror); a serialized
+/// metrics contract is cross-language, so both ends move together or not at all.
+pub const METRIC_FAMILIES: &[&str] = &[
+    "bfh_up",
+    "bfh_uptime_seconds",
+    "bfh_shards",
+    "bfh_books",
+    "bfh_published_total",
+    "bfh_snapshot_requests_total",
+    "bfh_book_snapshots_total",
+    "bfh_sequence_gaps_total",
+    "bfh_crossed_books_total",
+    "bfh_unverified_bridges_total",
+    "bfh_dropped_total",
+    "bfh_subscribers",
+    "bfh_shard_messages_total",
+    "bfh_shard_latency_ms",
+];
+
+fn render_prometheus(t: &Telemetry) -> String {
     let mut out = String::with_capacity(2048);
 
     let mut gauge = |name: &str, help: &str, kind: &str, body: String| {
@@ -781,7 +805,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
               .map(|s| format!("bfh_shard_latency_ms{{shard=\"{}\"}} {:.1}\n", s.id, s.latency_ms))
               .collect::<String>());
 
-    ([("content-type", "text/plain; version=0.0.4")], out)
+    out
 }
 
 // === MONITORING ===
@@ -1030,6 +1054,86 @@ mod tests {
         b.on_depth(1, 10, 0, vec![], vec![]);
         let mut books = books_of(vec![b]);
         assert!(take_stale_books(&mut books, 1e9, 30.0).is_empty());
+    }
+
+    fn telemetry_fixture() -> Telemetry {
+        Telemetry {
+            uptime_s: 42,
+            shards: vec![ShardInfo {
+                id: 0,
+                connected: true,
+                msg_count: 7,
+                last_msg_time: 1.0,
+                latency_ms: 12.5,
+            }],
+            connected: 1,
+            book_states: [("live".to_string(), 2)].into_iter().collect(),
+            live: 2,
+            total: 2,
+            gaps: 1,
+            crossed: 0,
+            snapshots_per_book: 3,
+            unverified_bridges: 1,
+            buffer_dropped: 0,
+            max_latency_ms: 12.5,
+            bbo_published: 100,
+            book_published: 50,
+            snapshots: 3,
+            bbo_dropped: 0,
+            book_dropped: 0,
+            subscriber_dropped: 0,
+            subscribers: 1,
+        }
+    }
+
+    #[test]
+    fn test_prometheus_declares_every_family_exactly_once() {
+        let body = render_prometheus(&telemetry_fixture());
+        for family in METRIC_FAMILIES {
+            assert_eq!(
+                body.matches(&format!("# TYPE {} ", family)).count(),
+                1,
+                "{} must be declared exactly once",
+                family
+            );
+        }
+        // Nothing may be emitted that is not in the declared contract.
+        let declared: Vec<&str> = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert_eq!(declared, METRIC_FAMILIES);
+    }
+
+    #[test]
+    fn test_prometheus_reports_unhealthy_as_zero() {
+        let mut t = telemetry_fixture();
+        t.connected = 0;
+        t.shards[0].connected = false;
+        assert!(!t.healthy());
+        assert!(render_prometheus(&t).contains("bfh_up 0\n"));
+    }
+
+    #[test]
+    fn test_healthy_needs_all_shards_and_a_live_majority() {
+        let mut t = telemetry_fixture();
+        assert!(t.healthy());
+        t.live = 1;
+        assert!(!t.healthy(), "1 of 2 live is not a majority");
+        t.live = 2;
+        t.connected = 0;
+        assert!(!t.healthy(), "a disconnected shard is never healthy");
+    }
+
+    #[test]
+    fn test_total_dropped_sums_every_shed_point() {
+        let mut t = telemetry_fixture();
+        t.bbo_dropped = 1;
+        t.book_dropped = 2;
+        t.subscriber_dropped = 4;
+        t.buffer_dropped = 8;
+        assert_eq!(t.total_dropped(), 15);
     }
 
     fn vols(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
