@@ -27,7 +27,14 @@ use crate::publisher;
 // === CONFIGURATION ===
 
 const BINANCE_FAPI: &str = "https://fapi.binance.com";
-const BINANCE_WS: &str = "wss://fstream.binance.com/ws";
+
+/// Binance announced (changelog 2026-03-05) a split of the futures stream host
+/// into /public, /market and /private, with the legacy /ws and /stream paths to
+/// be decommissioned 2026-04-23. As of 2026-08-31 that has NOT happened: /public
+/// and /market both return HTTP 404 and /ws still serves everything. Both streams
+/// we use (@depth and @bookTicker) are in the /public tier, so when the cutover
+/// does land, `--ws-base wss://fstream.binance.com/public` is the whole migration.
+pub const BINANCE_WS_DEFAULT: &str = "wss://fstream.binance.com/ws";
 
 const MAX_SYMBOLS_PER_SHARD: usize = 100;
 const SUBSCRIBE_BATCH_SIZE: usize = 50;
@@ -68,6 +75,22 @@ pub struct ShardInfo {
     pub latency_ms: f64,
 }
 
+/// Shared handles every shard needs. Grouped into a struct so shards cannot be
+/// wired up with the wrong `Arc` by positional mistake.
+#[derive(Clone)]
+struct ShardCtx {
+    books: Arc<Mutex<HashMap<String, Book>>>,
+    client: reqwest::Client,
+    bbo_tx: mpsc::Sender<BboEvent>,
+    book_tx: mpsc::Sender<BookEvent>,
+    shard_infos: Arc<Mutex<Vec<ShardInfo>>>,
+    snap_lock: Arc<Mutex<f64>>,
+    snap_count: Arc<AtomicU64>,
+    bbo_count: Arc<AtomicU64>,
+    book_count: Arc<AtomicU64>,
+    ws_base: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     books: Arc<Mutex<HashMap<String, Book>>>,
@@ -80,8 +103,17 @@ struct AppState {
 
 // === HELPERS ===
 
-fn put<T>(tx: &mpsc::Sender<T>, item: T) {
-    let _ = tx.try_send(item);
+/// Events shed because the dispatcher channel was full. Never silent: surfaced
+/// in /stats and the periodic stats line.
+pub static BBO_DROPPED: AtomicU64 = AtomicU64::new(0);
+pub static BOOK_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Non-blocking enqueue. tokio's mpsc has no sender-side pop, so a full channel
+/// sheds the NEWEST event (not the oldest). Counted via `dropped`.
+fn put<T>(tx: &mpsc::Sender<T>, item: T, dropped: &AtomicU64) {
+    if tx.try_send(item).is_err() {
+        dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn now_secs() -> f64 {
@@ -186,7 +218,7 @@ async fn sync_book(
     loop {
         {
             let books = books.lock().await;
-            if books.get(&symbol).map_or(true, |b| b.state != BookState::Buffering) {
+            if books.get(&symbol).is_none_or(|b| b.state != BookState::Buffering) {
                 return;
             }
         }
@@ -214,19 +246,20 @@ async fn sync_book(
 
 // === WEBSOCKET ===
 
-async fn run_shard(
-    shard_id: usize,
-    symbols: Vec<String>,
-    books: Arc<Mutex<HashMap<String, Book>>>,
-    client: reqwest::Client,
-    bbo_tx: mpsc::Sender<BboEvent>,
-    book_tx: mpsc::Sender<BookEvent>,
-    shard_infos: Arc<Mutex<Vec<ShardInfo>>>,
-    snap_lock: Arc<Mutex<f64>>,
-    snap_count: Arc<AtomicU64>,
-    bbo_count: Arc<AtomicU64>,
-    book_count: Arc<AtomicU64>,
-) {
+async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
+    let ShardCtx {
+        books,
+        client,
+        bbo_tx,
+        book_tx,
+        shard_infos,
+        snap_lock,
+        snap_count,
+        bbo_count,
+        book_count,
+        ws_base,
+    } = ctx;
+
     let mut reconnect_delay = RECONNECT_BASE;
     let mut sync_handles: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
@@ -266,7 +299,7 @@ async fn run_shard(
 
         info!("Shard {}: connecting ({} symbols)", shard_id, symbols.len());
 
-        match connect_async(BINANCE_WS).await {
+        match connect_async(&ws_base).await {
             Ok((ws_stream, _)) => {
                 {
                     let mut infos = shard_infos.lock().await;
@@ -411,6 +444,7 @@ async fn run_shard(
                                             last_update_id: book.last_update_id,
                                             ts: now_secs(),
                                         },
+                                        &BOOK_DROPPED,
                                     );
                                 }
                             }
@@ -442,6 +476,7 @@ async fn run_shard(
                                 ask_qty,
                                 ts: now_secs(),
                             },
+                            &BBO_DROPPED,
                         );
                     }
                 }
@@ -515,6 +550,13 @@ async fn stats_handler(State(state): State<AppState>) -> Json<Value> {
         "total_crossed": books.values().map(|b| b.crossed_count).sum::<u64>(),
         "total_snapshots_per_book": books.values().map(|b| b.snapshot_count).sum::<u64>(),
         "max_latency_ms": max_lat,
+        "dropped": {
+            "bbo_queue": BBO_DROPPED.load(Ordering::Relaxed),
+            "book_queue": BOOK_DROPPED.load(Ordering::Relaxed),
+            "subscriber_queue": publisher::SUBSCRIBER_DROPPED.load(Ordering::Relaxed),
+            "book_buffer": books.values().map(|b| b.buffer_dropped).sum::<u64>(),
+        },
+        "subscribers": publisher::subscriber_count().await,
     }))
 }
 
@@ -546,9 +588,14 @@ async fn log_stats(
         let total_gaps: u64 = books.values().map(|b| b.gap_count).sum();
         let total_crossed: u64 = books.values().map(|b| b.crossed_count).sum();
 
+        let dropped = BBO_DROPPED.load(Ordering::Relaxed)
+            + BOOK_DROPPED.load(Ordering::Relaxed)
+            + publisher::SUBSCRIBER_DROPPED.load(Ordering::Relaxed)
+            + books.values().map(|b| b.buffer_dropped).sum::<u64>();
+
         info!(
             "shards={}/{} | books: {} live, {} buffering | msgs={} | \
-             pub: {} bbo, {} book | snaps={} | latency={:.0}ms | gaps={} crossed={}",
+             pub: {} bbo, {} book | snaps={} | latency={:.0}ms | gaps={} crossed={} dropped={}",
             connected,
             infos.len(),
             live,
@@ -560,6 +607,7 @@ async fn log_stats(
             max_lat,
             total_gaps,
             total_crossed,
+            dropped,
         );
     }
 }
@@ -584,7 +632,12 @@ async fn check_stale(books: Arc<Mutex<HashMap<String, Book>>>) {
 
 // === MAIN ===
 
-pub async fn run(max_symbols: Option<usize>, port: u16, ws_port: u16) -> anyhow::Result<()> {
+pub async fn run(
+    max_symbols: Option<usize>,
+    port: u16,
+    ws_port: u16,
+    ws_base: String,
+) -> anyhow::Result<()> {
     info!("Starting Binance USD-M Futures Feed Handler");
 
     let client = reqwest::Client::new();
@@ -605,31 +658,34 @@ pub async fn run(max_symbols: Option<usize>, port: u16, ws_port: u16) -> anyhow:
     let bbo_count = Arc::new(AtomicU64::new(0));
     let book_count = Arc::new(AtomicU64::new(0));
 
-    let mut shard_infos = Vec::new();
-    for (i, chunk) in symbols.chunks(MAX_SYMBOLS_PER_SHARD).enumerate() {
-        shard_infos.push(ShardInfo {
+    // Build the full vec and share ONE Arc with every shard. Each shard writes its
+    // own slot; /health, /stats and log_stats read the same allocation.
+    let shard_infos: Vec<ShardInfo> = (0..symbols.chunks(MAX_SYMBOLS_PER_SHARD).count())
+        .map(|i| ShardInfo {
             id: i,
             connected: false,
             msg_count: 0,
             last_msg_time: 0.0,
             latency_ms: 0.0,
-        });
-        let syms = chunk.to_vec();
-        tokio::spawn(run_shard(
-            i,
-            syms,
-            books.clone(),
-            client.clone(),
-            bbo_tx.clone(),
-            book_tx.clone(),
-            Arc::new(Mutex::new(shard_infos.clone())),
-            snap_lock.clone(),
-            snap_count.clone(),
-            bbo_count.clone(),
-            book_count.clone(),
-        ));
-    }
+        })
+        .collect();
     let shard_infos = Arc::new(Mutex::new(shard_infos));
+
+    let shard_ctx = ShardCtx {
+        books: books.clone(),
+        client: client.clone(),
+        bbo_tx,
+        book_tx,
+        shard_infos: shard_infos.clone(),
+        snap_lock,
+        snap_count: snap_count.clone(),
+        bbo_count: bbo_count.clone(),
+        book_count: book_count.clone(),
+        ws_base,
+    };
+    for (i, chunk) in symbols.chunks(MAX_SYMBOLS_PER_SHARD).enumerate() {
+        tokio::spawn(run_shard(i, chunk.to_vec(), shard_ctx.clone()));
+    }
     info!("Created {} WS shards", symbols.chunks(MAX_SYMBOLS_PER_SHARD).len());
 
     let start_time = Instant::now();
@@ -663,19 +719,6 @@ pub async fn run(max_symbols: Option<usize>, port: u16, ws_port: u16) -> anyhow:
         snap_count.clone(),
     ));
     tokio::spawn(check_stale(books.clone()));
-
-    // Demo consumer
-    let demo_bbo_rx = publisher::subscribe("bbo".to_string(), None).await;
-    tokio::spawn(async move {
-        let mut rx = demo_bbo_rx;
-        let mut count = 0u64;
-        while let Some(msg) = rx.recv().await {
-            count += 1;
-            if count % 5000 == 0 {
-                info!("CONSUMER | msg #{} | {:?}", count, msg);
-            }
-        }
-    });
 
     // Start dispatcher
     publisher::run_dispatcher(bbo_rx, book_rx).await;
