@@ -145,6 +145,14 @@ class Book:
         self._ticker_bid = bid
         self._ticker_ask = ask
 
+    def mark_for_resync(self):
+        """Reset and re-enter "buffering" so a snapshot can be requested without
+        waiting for the next depth event. Used by the staleness sweeper: a symbol
+        that stopped ticking is exactly the one whose next depth event may be
+        minutes away, so reset() alone leaves it dark until then."""
+        self.reset()
+        self.state = "buffering"
+
     def reset(self):
         self.bids.clear()
         self.asks.clear()

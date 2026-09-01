@@ -295,15 +295,37 @@ async def log_stats(books: dict[str, Book], shard_infos: list[dict]):
         )
 
 
-async def check_stale(books: dict[str, Book]):
+def take_stale_books(books: dict[str, Book], now: float,
+                     threshold: float = STALE_THRESHOLD) -> list[str]:
+    """Mark every live-but-silent book for resync and return the symbols to
+    re-snapshot. Pure over `books` so the sweep decision is unit-testable.
+
+    last_update_time is pushed forward to `now` on trigger: a symbol whose
+    stream is genuinely dead would otherwise re-qualify on every tick and
+    snapshot-storm the REST budget.
+    """
+    stale = []
+    for book in books.values():
+        if book.state == "live" and (now - book.last_update_time) > threshold:
+            logger.warning("%s: stale for %.0fs, re-snapshotting", book.symbol,
+                           now - book.last_update_time)
+            book.mark_for_resync()
+            book.last_update_time = now
+            stale.append(book.symbol)
+    return stale
+
+
+async def check_stale(books: dict[str, Book], session: aiohttp.ClientSession):
+    resyncs: set[asyncio.Task] = set()
     while True:
         await asyncio.sleep(STALE_THRESHOLD / 2)
-        now = time.time()
-        for book in books.values():
-            if book.state == "live" and (now - book.last_update_time) > STALE_THRESHOLD:
-                logger.warning("%s: stale for %.0fs, resetting", book.symbol,
-                               now - book.last_update_time)
-                book.reset()
+        # Reset alone only re-arms the state machine; the snapshot still has to
+        # be asked for, or recovery waits on a depth event that may be minutes
+        # out on an illiquid symbol.
+        for sym in take_stale_books(books, time.time()):
+            task = asyncio.create_task(sync_book(session, books[sym]))
+            resyncs.add(task)
+            task.add_done_callback(resyncs.discard)
 
 
 async def demo_consumer():
@@ -367,7 +389,7 @@ async def main(max_symbols: int | None = None, port: int = 8080, ws_port: int = 
         bg_tasks = [
             asyncio.create_task(publisher.run_dispatcher(bbo_q, book_q)),
             asyncio.create_task(log_stats(books, shard_infos)),
-            asyncio.create_task(check_stale(books)),
+            asyncio.create_task(check_stale(books, session)),
             asyncio.create_task(demo_consumer()),
         ]
 
