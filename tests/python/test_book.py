@@ -277,3 +277,46 @@ def test_multiple_gaps_increment_counter():
     b.on_depth(301, 310, 300, [], [])
     b.on_depth(401, 410, 400, [], [])
     assert b.gap_count == 2
+
+
+# --- snapshot bridge / drop accounting ---
+
+def test_snapshot_bridge_broken_is_rejected():
+    """First replayable event starts AFTER the snapshot, so the diffs covering
+    (lastUpdateId, U) are gone. Must not go live on a book with a hole."""
+    b = Book("TEST")
+    b.on_depth(200, 210, 190, make_levels([("99", "1")]), [])
+    result = b.on_snapshot(100, make_levels([("100", "1")]), make_levels([("101", "1")]))
+    assert result is False
+    assert b.state == "buffering"
+    assert D("99") not in b.bids
+
+
+def test_snapshot_bridge_straddling_event_is_accepted():
+    """U <= lastUpdateId <= u: the documented bridge holds, so go live."""
+    b = Book("TEST")
+    b.on_depth(90, 210, 89, make_levels([("99", "1")]), [])
+    result = b.on_snapshot(100, make_levels([("100", "1")]), make_levels([("101", "1")]))
+    assert result is True
+    assert b.state == "live"
+    assert b.bids[D("99")] == D("1")
+    assert b.unverified_bridge_count == 0
+
+
+def test_unverified_bridge_is_counted():
+    """Snapshot newer than everything buffered: nothing straddles it, so the
+    bridge is unproven and must be counted rather than silently accepted."""
+    b = Book("TEST")
+    b.on_depth(1, 10, 0, [], [])
+    result = b.on_snapshot(100, make_levels([("100", "1")]), make_levels([("101", "1")]))
+    assert result is True
+    assert b.state == "live"
+    assert b.unverified_bridge_count == 1
+
+
+def test_buffer_overflow_drops_are_counted():
+    from book import BUFFER_MAX
+    b = Book("TEST")
+    for i in range(BUFFER_MAX + 7):
+        b.on_depth(i * 10 + 1, i * 10 + 10, i * 10, [], [])
+    assert b.buffer_dropped == 7
