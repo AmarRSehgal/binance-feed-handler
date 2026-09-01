@@ -21,7 +21,7 @@ curl http://localhost:8080/health
 curl -s http://localhost:8080/stats | python3 -m json.tool
 ```
 
-Flags: `--max-symbols N`, `--port N` (default 8080), `--ws-port N` (default 8081), `--ws-base URL` (default `wss://fstream.binance.com/ws`).
+Flags: `--max-symbols N` (takes the N most liquid by 24h quote volume, so a capped run includes BTCUSDT), `--symbols BTCUSDT,ETHUSDT` (explicit universe; unknown symbols are fatal at startup), `--port N` (default 8080), `--ws-port N` (default 8081), `--ws-base URL` (default `wss://fstream.binance.com/ws`).
 
 ### Subscribing to data
 

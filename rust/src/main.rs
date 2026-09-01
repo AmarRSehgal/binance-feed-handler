@@ -8,8 +8,18 @@ mod publisher;
 #[command(name = "binance-feed-handler")]
 #[command(about = "Binance USD-M Futures Feed Handler")]
 struct Args {
-    #[arg(long, help = "Cap symbol count (default: all perps)")]
+    #[arg(
+        long,
+        help = "Cap symbol count, taking the most liquid by 24h quote volume (default: all perps)"
+    )]
     max_symbols: Option<usize>,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Track exactly these symbols, e.g. BTCUSDT,ETHUSDT. Overrides --max-symbols"
+    )]
+    symbols: Vec<String>,
 
     #[arg(long, default_value = "8080", help = "Health server port")]
     port: u16,
@@ -42,7 +52,14 @@ async fn main() -> anyhow::Result<()> {
         .format_timestamp_millis()
         .init();
 
-    feed_handler::run(args.max_symbols, args.port, args.ws_port, args.ws_base).await
+    feed_handler::run(
+        args.max_symbols,
+        args.symbols,
+        args.port,
+        args.ws_port,
+        args.ws_base,
+    )
+    .await
 }
 
 mod scenarios {
