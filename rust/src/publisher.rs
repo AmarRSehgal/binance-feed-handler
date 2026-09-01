@@ -3,6 +3,7 @@
 /// Fans out BBO and book updates from feed handler output channels to
 /// multiple subscribers, with optional per-symbol and per-stream filtering.
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -41,10 +42,12 @@ static SUBSCRIBERS: std::sync::LazyLock<Arc<Mutex<Vec<Subscriber>>>> =
 
 // === PUB/SUB ===
 
+/// Register a subscriber. Returns the sender handle (pass it to `unsubscribe`
+/// to deregister eagerly) alongside the receiver.
 pub async fn subscribe(
     stream: String,
     symbols: Option<Vec<String>>,
-) -> mpsc::Receiver<Value> {
+) -> (mpsc::Sender<Value>, mpsc::Receiver<Value>) {
     let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE_MAX);
     let filter = match stream.as_str() {
         "bbo" => StreamFilter::Bbo,
@@ -54,12 +57,12 @@ pub async fn subscribe(
     let sym_set = symbols.map(|s| s.into_iter().collect::<HashSet<String>>());
     let mut subs = SUBSCRIBERS.lock().await;
     subs.push(Subscriber {
-        tx,
+        tx: tx.clone(),
         stream: filter,
         symbols: sym_set,
     });
     info!("Subscriber added ({} total)", subs.len());
-    rx
+    (tx, rx)
 }
 
 pub async fn unsubscribe(target_tx: &mpsc::Sender<Value>) {
@@ -68,13 +71,28 @@ pub async fn unsubscribe(target_tx: &mpsc::Sender<Value>) {
     info!("Subscriber removed ({} remaining)", subs.len());
 }
 
+/// Messages shed because a subscriber's queue was full (slow consumer).
+/// Never silent: surfaced in /stats.
+pub static SUBSCRIBER_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// tokio's mpsc has no sender-side pop, so a full subscriber queue sheds the
+/// NEWEST message, not the oldest. Counted via SUBSCRIBER_DROPPED.
 fn put_value(tx: &mpsc::Sender<Value>, msg: Value) {
-    let _ = tx.try_send(msg);
+    if tx.try_send(msg).is_err() {
+        SUBSCRIBER_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub async fn subscriber_count() -> usize {
+    SUBSCRIBERS.lock().await.len()
 }
 
 async fn publish(msg: Value, stream: &StreamFilter) {
     let symbol = msg.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-    let subs = SUBSCRIBERS.lock().await;
+    let mut subs = SUBSCRIBERS.lock().await;
+    // Reap subscribers whose receiver is gone. Without this a disconnected
+    // client leaks its slot forever and every publish keeps cloning for it.
+    subs.retain(|s| !s.tx.is_closed());
     for sub in subs.iter() {
         if sub.stream != *stream && sub.stream != StreamFilter::All {
             continue;
@@ -148,8 +166,8 @@ async fn handle_ws_client(mut socket: WebSocket) {
                                 v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
                             });
 
-                            let mut rx = subscribe(stream.clone(), symbols.clone()).await;
-                            sub_tx = None;
+                            let (tx, mut rx) = subscribe(stream.clone(), symbols.clone()).await;
+                            sub_tx = Some(tx);
 
                             let confirmation = serde_json::json!({
                                 "status": "subscribed",
@@ -182,6 +200,7 @@ async fn handle_ws_client(mut socket: WebSocket) {
                                                 if let Ok(v) = serde_json::from_str::<Value>(&t) {
                                                     if v.get("action").and_then(|a| a.as_str()) == Some("unsubscribe") {
                                                         if let Some(h) = stream_handle.take() { h.abort(); }
+                                                        if let Some(tx) = sub_tx.take() { unsubscribe(&tx).await; }
                                                         let _ = socket.send(Message::Text(r#"{"status":"unsubscribed"}"#.into())).await;
                                                         streaming = false;
                                                     }
@@ -206,6 +225,9 @@ async fn handle_ws_client(mut socket: WebSocket) {
 
     if let Some(h) = stream_handle.take() {
         h.abort();
+    }
+    if let Some(tx) = sub_tx.take() {
+        unsubscribe(&tx).await;
     }
     info!("WebSocket client disconnected");
 }
