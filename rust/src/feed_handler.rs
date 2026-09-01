@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::response::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
@@ -26,7 +27,10 @@ use crate::publisher;
 
 // === CONFIGURATION ===
 
-const BINANCE_FAPI: &str = "https://fapi.binance.com";
+/// REST base for exchangeInfo / depth snapshots. Overridable via `--fapi-base`
+/// so the reconnect/resync integration test can point the handler at a mock
+/// venue instead of the live exchange.
+pub const BINANCE_FAPI_DEFAULT: &str = "https://fapi.binance.com";
 
 /// Binance announced (changelog 2026-03-05) a split of the futures stream host
 /// into /public, /market and /private, with the legacy /ws and /stream paths to
@@ -89,6 +93,7 @@ struct ShardCtx {
     bbo_count: Arc<AtomicU64>,
     book_count: Arc<AtomicU64>,
     ws_base: String,
+    fapi_base: String,
 }
 
 #[derive(Clone)]
@@ -176,8 +181,11 @@ fn pick_top_by_volume(
     top
 }
 
-async fn fetch_quote_volumes(client: &reqwest::Client) -> anyhow::Result<HashMap<String, f64>> {
-    let url = format!("{}/fapi/v1/ticker/24hr", BINANCE_FAPI);
+async fn fetch_quote_volumes(
+    client: &reqwest::Client,
+    fapi_base: &str,
+) -> anyhow::Result<HashMap<String, f64>> {
+    let url = format!("{}/fapi/v1/ticker/24hr", fapi_base);
     let tickers: Vec<Ticker24h> = client.get(&url).send().await?.error_for_status()?.json().await?;
     Ok(tickers
         .into_iter()
@@ -187,10 +195,11 @@ async fn fetch_quote_volumes(client: &reqwest::Client) -> anyhow::Result<HashMap
 
 async fn fetch_symbols(
     client: &reqwest::Client,
+    fapi_base: &str,
     max_symbols: Option<usize>,
     explicit: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let url = format!("{}/fapi/v1/exchangeInfo", BINANCE_FAPI);
+    let url = format!("{}/fapi/v1/exchangeInfo", fapi_base);
     let info: ExchangeInfo = client.get(&url).send().await?.error_for_status()?.json().await?;
     let mut symbols: Vec<String> = info
         .symbols
@@ -224,7 +233,7 @@ async fn fetch_symbols(
 
     if let Some(max) = max_symbols {
         if max < symbols.len() {
-            let volumes = fetch_quote_volumes(client).await?;
+            let volumes = fetch_quote_volumes(client, fapi_base).await?;
             symbols = pick_top_by_volume(&symbols, &volumes, max);
         }
     }
@@ -233,6 +242,7 @@ async fn fetch_symbols(
 
 async fn fetch_snapshot(
     client: &reqwest::Client,
+    fapi_base: &str,
     symbol: &str,
     snap_lock: &Mutex<f64>,
     snap_count: &AtomicU64,
@@ -247,7 +257,7 @@ async fn fetch_snapshot(
         *last_t = now_secs();
     }
 
-    let url = format!("{}/fapi/v1/depth", BINANCE_FAPI);
+    let url = format!("{}/fapi/v1/depth", fapi_base);
     let resp = client
         .get(&url)
         .query(&[("symbol", symbol), ("limit", "500")])
@@ -275,6 +285,7 @@ async fn fetch_snapshot(
 
 async fn sync_book(
     client: reqwest::Client,
+    fapi_base: String,
     symbol: String,
     books: Arc<Mutex<HashMap<String, Book>>>,
     snap_lock: Arc<Mutex<f64>>,
@@ -289,7 +300,7 @@ async fn sync_book(
             }
         }
 
-        match fetch_snapshot(&client, &symbol, &snap_lock, &snap_count).await {
+        match fetch_snapshot(&client, &fapi_base, &symbol, &snap_lock, &snap_count).await {
             Ok(data) => {
                 let bids = parse_levels(&data.bids);
                 let asks = parse_levels(&data.asks);
@@ -324,6 +335,7 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
         bbo_count,
         book_count,
         ws_base,
+        fapi_base,
     } = ctx;
 
     let mut reconnect_delay = RECONNECT_BASE;
@@ -335,6 +347,7 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
         }
         let handle = tokio::spawn(sync_book(
             client.clone(),
+            fapi_base.clone(),
             sym.to_string(),
             books.clone(),
             snap_lock.clone(),
@@ -344,18 +357,6 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
     };
 
     loop {
-        {
-            let mut books = books.lock().await;
-            for sym in &symbols {
-                if let Some(book) = books.get_mut(sym) {
-                    book.reset();
-                }
-            }
-        }
-        for (_, h) in sync_handles.drain() {
-            h.abort();
-        }
-
         let mut stream_names = Vec::new();
         for sym in &symbols {
             let s = sym.to_lowercase();
@@ -556,6 +557,22 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
             let mut infos = shard_infos.lock().await;
             infos[shard_id].connected = false;
         }
+        // Unsync every book the moment the socket dies, not at the top of the
+        // next connect attempt: reconnect backoff runs up to 30s, and a book
+        // reported "live" during that window is a book whose depth is frozen.
+        // This also re-arms the state machine before we re-subscribe.
+        {
+            let mut books = books.lock().await;
+            for sym in &symbols {
+                if let Some(book) = books.get_mut(sym) {
+                    book.reset();
+                }
+            }
+        }
+        for (_, h) in sync_handles.drain() {
+            h.abort();
+        }
+
         let jitter: f64 = rand::rng().random_range(0.0..1.0);
         let wait = reconnect_delay + jitter;
         error!(
@@ -567,113 +584,227 @@ async fn run_shard(shard_id: usize, symbols: Vec<String>, ctx: ShardCtx) {
     }
 }
 
+// === TELEMETRY ===
+
+/// One consistent read of everything the observability surfaces report, taken
+/// under a single pass over the books. /health, /stats, /metrics and the periodic
+/// stats line all derive from this, so they can never disagree -- and a new
+/// counter is added in one place instead of four.
+struct Telemetry {
+    uptime_s: u64,
+    shards: Vec<ShardInfo>,
+    connected: usize,
+    book_states: HashMap<String, usize>,
+    live: usize,
+    total: usize,
+    gaps: u64,
+    crossed: u64,
+    snapshots_per_book: u64,
+    unverified_bridges: u64,
+    buffer_dropped: u64,
+    max_latency_ms: f64,
+    bbo_published: u64,
+    book_published: u64,
+    snapshots: u64,
+    bbo_dropped: u64,
+    book_dropped: u64,
+    subscriber_dropped: u64,
+    subscribers: usize,
+}
+
+impl Telemetry {
+    async fn gather(state: &AppState) -> Self {
+        let books = state.books.lock().await;
+        let shards = state.shard_infos.lock().await.clone();
+
+        let mut book_states: HashMap<String, usize> = HashMap::new();
+        let mut gaps = 0;
+        let mut crossed = 0;
+        let mut snapshots_per_book = 0;
+        let mut unverified_bridges = 0;
+        let mut buffer_dropped = 0;
+        let mut live = 0;
+        for b in books.values() {
+            *book_states
+                .entry(format!("{:?}", b.state).to_lowercase())
+                .or_default() += 1;
+            if b.state == BookState::Live {
+                live += 1;
+            }
+            gaps += b.gap_count;
+            crossed += b.crossed_count;
+            snapshots_per_book += b.snapshot_count;
+            unverified_bridges += b.unverified_bridge_count;
+            buffer_dropped += b.buffer_dropped;
+        }
+
+        Self {
+            uptime_s: state.start_time.elapsed().as_secs(),
+            connected: shards.iter().filter(|s| s.connected).count(),
+            max_latency_ms: shards
+                .iter()
+                .filter(|s| s.latency_ms > 0.0)
+                .map(|s| s.latency_ms)
+                .fold(0.0_f64, f64::max),
+            shards,
+            book_states,
+            live,
+            total: books.len(),
+            gaps,
+            crossed,
+            snapshots_per_book,
+            unverified_bridges,
+            buffer_dropped,
+            bbo_published: state.bbo_count.load(Ordering::Relaxed),
+            book_published: state.book_count.load(Ordering::Relaxed),
+            snapshots: state.snap_count.load(Ordering::Relaxed),
+            bbo_dropped: BBO_DROPPED.load(Ordering::Relaxed),
+            book_dropped: BOOK_DROPPED.load(Ordering::Relaxed),
+            subscriber_dropped: publisher::SUBSCRIBER_DROPPED.load(Ordering::Relaxed),
+            subscribers: publisher::subscriber_count().await,
+        }
+    }
+
+    /// Every shard connected and a majority of books live. Same predicate the
+    /// /health status code is derived from, so an orchestrator's liveness probe
+    /// and a human reading /health can never draw opposite conclusions.
+    fn healthy(&self) -> bool {
+        self.connected == self.shards.len() && self.live > self.total / 2
+    }
+
+    fn total_dropped(&self) -> u64 {
+        self.bbo_dropped + self.book_dropped + self.subscriber_dropped + self.buffer_dropped
+    }
+
+    fn book_state(&self, state: &str) -> usize {
+        self.book_states.get(state).copied().unwrap_or(0)
+    }
+}
+
 // === HEALTH ===
 
-async fn health_handler(State(state): State<AppState>) -> Json<Value> {
-    let books = state.books.lock().await;
-    let infos = state.shard_infos.lock().await;
-    let connected = infos.iter().filter(|s| s.connected).count();
-    let live = books.values().filter(|b| b.state == BookState::Live).count();
-    let total = books.len();
-    let healthy = connected == infos.len() && live > total / 2;
-    Json(serde_json::json!({
-        "healthy": healthy,
-        "uptime_s": state.start_time.elapsed().as_secs(),
-        "shards": format!("{}/{} connected", connected, infos.len()),
-        "books": format!("{}/{} live", live, total),
-    }))
+async fn health_handler(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let t = Telemetry::gather(&state).await;
+    // 503 when unhealthy: a probe that only ever sees 200 cannot restart or
+    // depool anything, which is the whole point of the endpoint.
+    let code = if t.healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "healthy": t.healthy(),
+            "uptime_s": t.uptime_s,
+            "shards": format!("{}/{} connected", t.connected, t.shards.len()),
+            "books": format!("{}/{} live", t.live, t.total),
+        })),
+    )
 }
 
 async fn stats_handler(State(state): State<AppState>) -> Json<Value> {
-    let books = state.books.lock().await;
-    let infos = state.shard_infos.lock().await;
-    let mut states: HashMap<String, usize> = HashMap::new();
-    for b in books.values() {
-        let key = format!("{:?}", b.state).to_lowercase();
-        *states.entry(key).or_default() += 1;
-    }
-    let latencies: Vec<f64> = infos
-        .iter()
-        .filter(|s| s.latency_ms > 0.0)
-        .map(|s| s.latency_ms)
-        .collect();
-    let max_lat = latencies.iter().cloned().fold(0.0_f64, f64::max);
-
+    let t = Telemetry::gather(&state).await;
     Json(serde_json::json!({
-        "uptime_s": state.start_time.elapsed().as_secs(),
-        "book_states": states,
-        "shards": infos.iter().map(|s| serde_json::json!({
-            "id": s.id,
-            "connected": s.connected,
-            "msg_count": s.msg_count,
-            "last_msg_time": s.last_msg_time,
-            "latency_ms": s.latency_ms,
-        })).collect::<Vec<_>>(),
-        "bbo_published": state.bbo_count.load(Ordering::Relaxed),
-        "book_published": state.book_count.load(Ordering::Relaxed),
-        "snapshots": state.snap_count.load(Ordering::Relaxed),
-        "total_gaps": books.values().map(|b| b.gap_count).sum::<u64>(),
-        "total_crossed": books.values().map(|b| b.crossed_count).sum::<u64>(),
-        "total_snapshots_per_book": books.values().map(|b| b.snapshot_count).sum::<u64>(),
-        "max_latency_ms": max_lat,
+        "uptime_s": t.uptime_s,
+        "book_states": t.book_states,
+        "shards": t.shards,
+        "bbo_published": t.bbo_published,
+        "book_published": t.book_published,
+        "snapshots": t.snapshots,
+        "total_gaps": t.gaps,
+        "total_crossed": t.crossed,
+        "total_snapshots_per_book": t.snapshots_per_book,
+        "total_unverified_bridges": t.unverified_bridges,
+        "max_latency_ms": t.max_latency_ms,
         "dropped": {
-            "bbo_queue": BBO_DROPPED.load(Ordering::Relaxed),
-            "book_queue": BOOK_DROPPED.load(Ordering::Relaxed),
-            "subscriber_queue": publisher::SUBSCRIBER_DROPPED.load(Ordering::Relaxed),
-            "book_buffer": books.values().map(|b| b.buffer_dropped).sum::<u64>(),
+            "bbo_queue": t.bbo_dropped,
+            "book_queue": t.book_dropped,
+            "subscriber_queue": t.subscriber_dropped,
+            "book_buffer": t.buffer_dropped,
         },
-        "subscribers": publisher::subscriber_count().await,
+        "subscribers": t.subscribers,
     }))
+}
+
+/// Prometheus text exposition. Every counter that /stats reports, in the form a
+/// scraper can alert on -- `bfh_sequence_gaps_total` and `bfh_dropped_total` are
+/// the two worth paging on.
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let t = Telemetry::gather(&state).await;
+    let mut out = String::with_capacity(2048);
+
+    let mut gauge = |name: &str, help: &str, kind: &str, body: String| {
+        out.push_str(&format!("# HELP {} {}\n# TYPE {} {}\n{}", name, help, name, kind, body));
+    };
+
+    gauge(
+        "bfh_up",
+        "1 when every shard is connected and a majority of books are live",
+        "gauge",
+        format!("bfh_up {}\n", u8::from(t.healthy())),
+    );
+    gauge("bfh_uptime_seconds", "Process uptime", "gauge",
+          format!("bfh_uptime_seconds {}\n", t.uptime_s));
+    gauge("bfh_shards", "WebSocket shards by connection state", "gauge",
+          format!("bfh_shards{{state=\"connected\"}} {}\nbfh_shards{{state=\"disconnected\"}} {}\n",
+                  t.connected, t.shards.len() - t.connected));
+    gauge("bfh_books", "Order books by sync state", "gauge",
+          format!("bfh_books{{state=\"live\"}} {}\nbfh_books{{state=\"buffering\"}} {}\nbfh_books{{state=\"uninitialized\"}} {}\n",
+                  t.book_state("live"), t.book_state("buffering"), t.book_state("uninitialized")));
+    gauge("bfh_published_total", "Events published downstream", "counter",
+          format!("bfh_published_total{{stream=\"bbo\"}} {}\nbfh_published_total{{stream=\"book\"}} {}\n",
+                  t.bbo_published, t.book_published));
+    gauge("bfh_snapshot_requests_total", "REST depth snapshots requested", "counter",
+          format!("bfh_snapshot_requests_total {}\n", t.snapshots));
+    gauge("bfh_book_snapshots_total", "Snapshots successfully applied to a book", "counter",
+          format!("bfh_book_snapshots_total {}\n", t.snapshots_per_book));
+    gauge("bfh_sequence_gaps_total", "Depth sequence gaps detected (pu chain broken)", "counter",
+          format!("bfh_sequence_gaps_total {}\n", t.gaps));
+    gauge("bfh_crossed_books_total", "Integrity failures where bid >= ask", "counter",
+          format!("bfh_crossed_books_total {}\n", t.crossed));
+    gauge("bfh_unverified_bridges_total",
+          "Snapshots that went live without a buffered event proving U <= lastUpdateId <= u",
+          "counter",
+          format!("bfh_unverified_bridges_total {}\n", t.unverified_bridges));
+    gauge("bfh_dropped_total", "Messages shed, by shedding point", "counter",
+          format!("bfh_dropped_total{{queue=\"bbo\"}} {}\nbfh_dropped_total{{queue=\"book\"}} {}\nbfh_dropped_total{{queue=\"subscriber\"}} {}\nbfh_dropped_total{{queue=\"resync_buffer\"}} {}\n",
+                  t.bbo_dropped, t.book_dropped, t.subscriber_dropped, t.buffer_dropped));
+    gauge("bfh_subscribers", "Connected downstream subscribers", "gauge",
+          format!("bfh_subscribers {}\n", t.subscribers));
+    gauge("bfh_shard_messages_total", "WebSocket messages received per shard", "counter",
+          t.shards.iter()
+              .map(|s| format!("bfh_shard_messages_total{{shard=\"{}\"}} {}\n", s.id, s.msg_count))
+              .collect::<String>());
+    gauge("bfh_shard_latency_ms", "Event-time to receive-time lag per shard", "gauge",
+          t.shards.iter()
+              .map(|s| format!("bfh_shard_latency_ms{{shard=\"{}\"}} {:.1}\n", s.id, s.latency_ms))
+              .collect::<String>());
+
+    ([("content-type", "text/plain; version=0.0.4")], out)
 }
 
 // === MONITORING ===
 
-async fn log_stats(
-    books: Arc<Mutex<HashMap<String, Book>>>,
-    shard_infos: Arc<Mutex<Vec<ShardInfo>>>,
-    bbo_count: Arc<AtomicU64>,
-    book_count: Arc<AtomicU64>,
-    snap_count: Arc<AtomicU64>,
-) {
+async fn log_stats(state: AppState) {
     loop {
         sleep(Duration::from_secs(STATS_INTERVAL)).await;
-        let books = books.lock().await;
-        let infos = shard_infos.lock().await;
-        let live = books.values().filter(|b| b.state == BookState::Live).count();
-        let buffering = books
-            .values()
-            .filter(|b| b.state == BookState::Buffering)
-            .count();
-        let connected = infos.iter().filter(|s| s.connected).count();
-        let total_msgs: u64 = infos.iter().map(|s| s.msg_count).sum();
-        let max_lat = infos
-            .iter()
-            .filter(|s| s.latency_ms > 0.0)
-            .map(|s| s.latency_ms)
-            .fold(0.0_f64, f64::max);
-        let total_gaps: u64 = books.values().map(|b| b.gap_count).sum();
-        let total_crossed: u64 = books.values().map(|b| b.crossed_count).sum();
-
-        let dropped = BBO_DROPPED.load(Ordering::Relaxed)
-            + BOOK_DROPPED.load(Ordering::Relaxed)
-            + publisher::SUBSCRIBER_DROPPED.load(Ordering::Relaxed)
-            + books.values().map(|b| b.buffer_dropped).sum::<u64>();
-
+        let t = Telemetry::gather(&state).await;
         info!(
             "shards={}/{} | books: {} live, {} buffering | msgs={} | \
              pub: {} bbo, {} book | snaps={} | latency={:.0}ms | gaps={} crossed={} dropped={}",
-            connected,
-            infos.len(),
-            live,
-            buffering,
-            total_msgs,
-            bbo_count.load(Ordering::Relaxed),
-            book_count.load(Ordering::Relaxed),
-            snap_count.load(Ordering::Relaxed),
-            max_lat,
-            total_gaps,
-            total_crossed,
-            dropped,
+            t.connected,
+            t.shards.len(),
+            t.book_state("live"),
+            t.book_state("buffering"),
+            t.shards.iter().map(|s| s.msg_count).sum::<u64>(),
+            t.bbo_published,
+            t.book_published,
+            t.snapshots,
+            t.max_latency_ms,
+            t.gaps,
+            t.crossed,
+            t.total_dropped(),
         );
     }
 }
@@ -708,6 +839,7 @@ fn take_stale_books(
 async fn check_stale(
     books: Arc<Mutex<HashMap<String, Book>>>,
     client: reqwest::Client,
+    fapi_base: String,
     snap_lock: Arc<Mutex<f64>>,
     snap_count: Arc<AtomicU64>,
 ) {
@@ -723,6 +855,7 @@ async fn check_stale(
         for symbol in stale {
             tokio::spawn(sync_book(
                 client.clone(),
+                fapi_base.clone(),
                 symbol,
                 books.clone(),
                 snap_lock.clone(),
@@ -734,17 +867,44 @@ async fn check_stale(
 
 // === MAIN ===
 
-pub async fn run(
-    max_symbols: Option<usize>,
-    symbols_arg: Vec<String>,
-    port: u16,
-    ws_port: u16,
-    ws_base: String,
-) -> anyhow::Result<()> {
+/// Everything `run` needs. A struct rather than positional args so a test
+/// pointing at a mock venue cannot transpose the two base URLs.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub max_symbols: Option<usize>,
+    pub symbols: Vec<String>,
+    pub port: u16,
+    pub ws_port: u16,
+    pub ws_base: String,
+    pub fapi_base: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_symbols: None,
+            symbols: Vec::new(),
+            port: 8080,
+            ws_port: 8081,
+            ws_base: BINANCE_WS_DEFAULT.to_string(),
+            fapi_base: BINANCE_FAPI_DEFAULT.to_string(),
+        }
+    }
+}
+
+pub async fn run(cfg: Config) -> anyhow::Result<()> {
+    let Config {
+        max_symbols,
+        symbols: symbols_arg,
+        port,
+        ws_port,
+        ws_base,
+        fapi_base,
+    } = cfg;
     info!("Starting Binance USD-M Futures Feed Handler");
 
     let client = reqwest::Client::new();
-    let symbols = fetch_symbols(&client, max_symbols, &symbols_arg).await?;
+    let symbols = fetch_symbols(&client, &fapi_base, max_symbols, &symbols_arg).await?;
     info!("Tracking {} perpetual symbols", symbols.len());
 
     let books: HashMap<String, Book> = symbols
@@ -785,6 +945,7 @@ pub async fn run(
         bbo_count: bbo_count.clone(),
         book_count: book_count.clone(),
         ws_base,
+        fapi_base: fapi_base.clone(),
     };
     for (i, chunk) in symbols.chunks(MAX_SYMBOLS_PER_SHARD).enumerate() {
         tokio::spawn(run_shard(i, chunk.to_vec(), shard_ctx.clone()));
@@ -804,7 +965,8 @@ pub async fn run(
     let app = axum::Router::new()
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
-        .with_state(app_state);
+        .route("/metrics", get(metrics_handler))
+        .with_state(app_state.clone());
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     info!("Health server on :{}", port);
@@ -814,16 +976,11 @@ pub async fn run(
 
     publisher::start_ws_server(ws_port).await?;
 
-    tokio::spawn(log_stats(
-        books.clone(),
-        shard_infos.clone(),
-        bbo_count.clone(),
-        book_count.clone(),
-        snap_count.clone(),
-    ));
+    tokio::spawn(log_stats(app_state));
     tokio::spawn(check_stale(
         books.clone(),
         client.clone(),
+        fapi_base.clone(),
         snap_lock.clone(),
         snap_count.clone(),
     ));

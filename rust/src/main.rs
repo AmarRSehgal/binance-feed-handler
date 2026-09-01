@@ -1,8 +1,6 @@
 use clap::Parser;
 
-mod book;
-mod feed_handler;
-mod publisher;
+use binance_feed_handler::feed_handler;
 
 #[derive(Parser)]
 #[command(name = "binance-feed-handler")]
@@ -34,6 +32,13 @@ struct Args {
     )]
     ws_base: String,
 
+    #[arg(
+        long,
+        default_value = feed_handler::BINANCE_FAPI_DEFAULT,
+        help = "Binance REST base URL (exchangeInfo, depth snapshots)"
+    )]
+    fapi_base: String,
+
     #[arg(long, help = "Run cross-language comparison scenarios and print JSON")]
     test_scenarios: bool,
 }
@@ -52,18 +57,19 @@ async fn main() -> anyhow::Result<()> {
         .format_timestamp_millis()
         .init();
 
-    feed_handler::run(
-        args.max_symbols,
-        args.symbols,
-        args.port,
-        args.ws_port,
-        args.ws_base,
-    )
+    feed_handler::run(feed_handler::Config {
+        max_symbols: args.max_symbols,
+        symbols: args.symbols,
+        port: args.port,
+        ws_port: args.ws_port,
+        ws_base: args.ws_base,
+        fapi_base: args.fapi_base,
+    })
     .await
 }
 
 mod scenarios {
-    use crate::book::{Book, parse_levels};
+    use binance_feed_handler::book::{parse_levels, Action, Book, BookState};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::{json, Value};
@@ -72,19 +78,19 @@ mod scenarios {
         pairs.iter().map(|(p, q)| (p.parse().unwrap(), q.parse().unwrap())).collect()
     }
 
-    fn action_str(a: crate::book::Action) -> Value {
+    fn action_str(a: Action) -> Value {
         match a {
-            crate::book::Action::Publish => json!("publish"),
-            crate::book::Action::NeedSnapshot => json!("need_snapshot"),
-            crate::book::Action::None_ => Value::Null,
+            Action::Publish => json!("publish"),
+            Action::NeedSnapshot => json!("need_snapshot"),
+            Action::None_ => Value::Null,
         }
     }
 
     fn state_str(b: &Book) -> &'static str {
         match b.state {
-            crate::book::BookState::Uninitialized => "uninitialized",
-            crate::book::BookState::Buffering => "buffering",
-            crate::book::BookState::Live => "live",
+            BookState::Uninitialized => "uninitialized",
+            BookState::Buffering => "buffering",
+            BookState::Live => "live",
         }
     }
 
@@ -170,20 +176,20 @@ mod scenarios {
             uid += 10;
             // We can't directly access bbo_mismatch_count (private), so we infer
             // from the state. But let's track based on state remaining live.
-            mismatch_counts.push(if b.state == crate::book::BookState::Live { "live" } else { "buffering" });
+            mismatch_counts.push(if b.state == BookState::Live { "live" } else { "buffering" });
         }
 
         b.set_ticker_bbo(dec!(150.00), dec!(151.00));
         b.on_depth(uid + 1, uid + 10, uid, vec![], vec![]);
         uid += 10;
-        mismatch_counts.push(if b.state == crate::book::BookState::Live { "live" } else { "buffering" });
+        mismatch_counts.push(if b.state == BookState::Live { "live" } else { "buffering" });
 
         b.set_ticker_bbo(dec!(149.00), dec!(152.00));
-        let mut final_action = crate::book::Action::None_;
+        let mut final_action = Action::None_;
         for _ in 0..10 {
             final_action = b.on_depth(uid + 1, uid + 10, uid, vec![], vec![]);
             uid += 10;
-            if b.state != crate::book::BookState::Live { break; }
+            if b.state != BookState::Live { break; }
         }
 
         json!({
