@@ -17,6 +17,13 @@ struct Args {
     #[arg(long, default_value = "8081", help = "WebSocket server port")]
     ws_port: u16,
 
+    #[arg(
+        long,
+        default_value = feed_handler::BINANCE_WS_DEFAULT,
+        help = "Binance stream base URL. Switch to wss://fstream.binance.com/public once Binance actually retires the legacy /ws path"
+    )]
+    ws_base: String,
+
     #[arg(long, help = "Run cross-language comparison scenarios and print JSON")]
     test_scenarios: bool,
 }
@@ -35,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .format_timestamp_millis()
         .init();
 
-    feed_handler::run(args.max_symbols, args.port, args.ws_port).await
+    feed_handler::run(args.max_symbols, args.port, args.ws_port, args.ws_base).await
 }
 
 mod scenarios {
